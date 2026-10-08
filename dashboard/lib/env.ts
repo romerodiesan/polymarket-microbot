@@ -1,9 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-export const ROOT = path.resolve(/*turbopackIgnore: true*/ process.cwd(), process.env.MICROBOT_ROOT ?? "..");
+/** The bot's directory (its .env, data/ and virtualenv); the sibling bot/ folder unless MICROBOT_ROOT says otherwise. */
+export const ROOT = path.resolve(/*turbopackIgnore: true*/ process.cwd(), process.env.MICROBOT_ROOT ?? "../bot");
 
-/** The bot's .env at the repo root; read on every call so edits apply without a restart. */
+/** The bot's .env; read on every call so edits apply without a restart. */
 export function readEnvFile(): Record<string, string> {
   const file = path.join(/*turbopackIgnore: true*/ ROOT, ".env");
   if (!existsSync(file)) return {};

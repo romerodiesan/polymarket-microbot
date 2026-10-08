@@ -9,16 +9,26 @@ en **paper mode por defecto**.
 > no modela latencia, cola ni impacto en el mercado, así que sigue siendo optimista. Cumple las reglas de
 > Polymarket y de tu jurisdicción.
 
+El repositorio tiene dos partes independientes:
+
+```text
+bot/         bot en Python: configuración (.env), datos (data/) y su virtualenv (.bot/)
+dashboard/   app Next.js que lee los datos del bot y lo inicia, detiene y entrena
+```
+
 ## Instalación
 
+Todo lo del bot se ejecuta dentro de `bot/`:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+cd bot
+python3 -m venv .bot
+source .bot/bin/activate
 pip install -e '.[dev]'
 cp .env.example .env
 ```
 
-En `.env`, coloca los token IDs de **YES** y **NO**, no el condition ID:
+En `bot/.env`, coloca los token IDs de **YES** y **NO**, no el condition ID:
 
 ```dotenv
 PM_YES_TOKEN_ID=...
@@ -38,13 +48,14 @@ PM_SERIES_SLUG=btc-up-or-down-15m   # o btc-up-or-down-5m, btc-up-or-down-hourly
 Cada fila de `features` y `fills` guarda el `market` (slug) y el `outcome` (`YES` = primer resultado,
 p. ej. "Up"; `NO` = segundo).
 
-Ejecuta:
+Ejecuta desde `bot/` (o inícialo desde el dashboard):
 
 ```bash
 microbot
 ```
 
-Mientras corre (cada `PM_EXPORT_INTERVAL_SECONDS`, 5 s por defecto) y al detenerlo con `Ctrl+C`, genera:
+Mientras corre (cada `PM_EXPORT_INTERVAL_SECONDS`, 5 s por defecto) y al detenerlo con `Ctrl+C`, genera
+en `bot/`:
 
 - `data/microbot.duckdb`
 - `data/parquet/features.parquet`
@@ -52,14 +63,16 @@ Mientras corre (cada `PM_EXPORT_INTERVAL_SECONDS`, 5 s por defecto) y al detener
 
 ## Dashboard
 
-`dashboard/` es una app Next.js que lee esos Parquet. Tiene tres secciones:
+`dashboard/` es una app Next.js que lee esos Parquet de `../bot` (cámbialo con `MICROBOT_ROOT`). Pide la
+contraseña `DASHBOARD_PASSWORD` de `bot/.env`, y desde la barra superior inicia y detiene el bot con el
+virtualenv `bot/.bot` (o `bot/.venv`). Tiene tres secciones:
 
 - **En vivo** (`/`): el bot en vivo o en modo reproducción (bid/ask/mid con las operaciones, score,
   equity/PnL y fills).
 - **Datos** (`/data`): resumen de la recopilación (filas, sesiones, filas por minuto, estadísticas de
   features, preparación para entrenar y últimas filas).
 - **Entrenamiento** (`/training`): lanza y detiene `microbot-train`, con historial, métricas,
-  coeficientes y log. Cada ejecución se guarda en `data/training/<id>/` (modelo, métricas y log) y
+  coeficientes y log. Cada ejecución se guarda en `bot/data/training/<id>/` (modelo, métricas y log) y
   entrena desde el Parquet exportado, así que funciona con el bot en marcha. Requiere `pip install -e '.[ml]'`.
 
 ```bash
@@ -79,7 +92,7 @@ SELECT * FROM fills ORDER BY ts DESC LIMIT 20;
 
 ## Entrenar el modelo base
 
-Después de recopilar suficientes datos (preferiblemente varias sesiones y regímenes):
+Después de recopilar suficientes datos (preferiblemente varias sesiones y regímenes), desde `bot/`:
 
 ```bash
 pip install -e '.[ml]'
@@ -176,6 +189,7 @@ Los pesos y umbrales son un punto de partida, no parámetros optimizados.
 ## Pruebas
 
 ```bash
+cd bot
 pytest -q
 ruff check .
 ```
@@ -183,12 +197,14 @@ ruff check .
 ## Estructura
 
 ```text
-src/microbot/book.py       libro L2 local
-src/microbot/features.py   variables de microestructura
-src/microbot/strategy.py   reglas de entrada y salida
-src/microbot/positions.py  inventario, precio medio y PnL realizado
-src/microbot/broker.py     paper broker y adaptador live
-src/microbot/storage.py    DuckDB y exportación Parquet
-src/microbot/ws.py         WebSocket y reconexión
-src/microbot/main.py       orquestación
+bot/src/microbot/book.py       libro L2 local
+bot/src/microbot/features.py   variables de microestructura
+bot/src/microbot/strategy.py   reglas de entrada y salida
+bot/src/microbot/positions.py  inventario, precio medio y PnL realizado
+bot/src/microbot/broker.py     paper broker y adaptador live
+bot/src/microbot/storage.py    DuckDB y exportación Parquet
+bot/src/microbot/ws.py         WebSocket y reconexión
+bot/src/microbot/main.py       orquestación
+bot/src/microbot/train.py      entrenamiento del modelo base
+dashboard/                     app Next.js (en vivo, datos, entrenamiento, control del bot)
 ```

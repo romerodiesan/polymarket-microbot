@@ -3,7 +3,7 @@ import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { ROOT, currentTokens, lookupMarket, readEnvFile, readParquet } from "./data";
 
-/** Same order as FEATURE_COLUMNS in src/microbot/model.py. */
+/** Same order as FEATURE_COLUMNS in bot/src/microbot/model.py. */
 export const FEATURE_COLUMNS = [
   "spread_ticks",
   "weighted_imbalance",

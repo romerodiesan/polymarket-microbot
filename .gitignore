@@ -21,7 +21,7 @@ dist/
 htmlcov/
 
 # Bot output: database, Parquet exports, models and training runs
-/data/
+/bot/data/
 *.duckdb
 *.duckdb.wal
 *.parquet
