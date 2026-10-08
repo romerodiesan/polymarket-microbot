@@ -1,9 +1,28 @@
 "use client";
 
-import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, XAxis, YAxis } from "recharts";
+import { Bar, BarChart, CartesianGrid, Cell, LabelList, ReferenceLine, XAxis, YAxis } from "recharts";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
+import { useChartTheme } from "./theme";
 
 export type BarDatum = { x: string | number; value: number };
+
+function niceStep(raw: number) {
+  const pow = 10 ** Math.floor(Math.log10(raw));
+  const n = raw / pow;
+  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * pow;
+}
+
+/** Round ticks covering the data and zero; with value labels, room left of negative bars for theirs. */
+function valueTicks(values: number[], padNegative: boolean) {
+  let min = Math.min(0, ...values);
+  const max = Math.max(0, ...values);
+  if (max === min) return undefined;
+  if (padNegative && min < 0) min -= (max - min) * 0.25;
+  const step = niceStep((max - min) / 4);
+  const ticks: number[] = [];
+  for (let t = Math.floor(min / step) * step; t <= max + step * 0.999; t += step) ticks.push(Number(t.toPrecision(12)));
+  return ticks;
+}
 
 export function BarSeries<T extends BarDatum>({
   data,
@@ -16,6 +35,7 @@ export function BarSeries<T extends BarDatum>({
   formatLabel,
   formatValue = (v) => v.toLocaleString("en-US"),
   categoryWidth = 140,
+  showValues = false,
 }: {
   data: T[];
   label: string;
@@ -29,12 +49,17 @@ export function BarSeries<T extends BarDatum>({
   formatLabel?: (row: T) => React.ReactNode;
   formatValue?: (value: number) => string;
   categoryWidth?: number;
+  /** Print each bar's value at its end. */
+  showValues?: boolean;
 }) {
+  const chartTheme = useChartTheme();
+  const tick = { fill: chartTheme.text, fontSize: chartTheme.fontSize, fontFamily: chartTheme.font };
   const config = { value: { label, color } } satisfies ChartConfig;
   const rows = orientation === "rows";
+  const ticks = rows ? valueTicks(data.map((d) => d.value), showValues) : undefined;
   const tooltip = (
     <ChartTooltip
-      cursor={{ fill: "rgba(255,255,255,0.06)" }}
+      cursor={{ fill: chartTheme.cursorFill }}
       content={
         <ChartTooltipContent
           labelFormatter={(_, payload) => {
@@ -64,33 +89,78 @@ export function BarSeries<T extends BarDatum>({
         accessibilityLayer
         data={data}
         layout={rows ? "vertical" : "horizontal"}
-        margin={{ top: 8, right: 12, bottom: 0, left: rows ? 0 : -12 }}
+        margin={{
+          top: 8,
+          right: showValues && rows ? 48 : 12,
+          bottom: 0,
+          left: rows ? 0 : -12,
+        }}
       >
-        <CartesianGrid vertical={rows} horizontal={!rows} strokeDasharray="3 3" />
+        <CartesianGrid vertical={rows} horizontal={!rows} stroke={chartTheme.grid} />
         {rows ? (
           <>
-            <XAxis type="number" tickLine={false} axisLine={false} fontSize={11} tickFormatter={(v: number) => formatValue(v)} />
+            <XAxis
+              type="number"
+              tickLine={false}
+              axisLine={false}
+              tick={tick}
+              tickFormatter={(v: number) => formatValue(v)}
+              ticks={ticks}
+              domain={ticks ? [ticks[0], ticks[ticks.length - 1]] : undefined}
+            />
             <YAxis
               type="category"
               dataKey="x"
               tickLine={false}
               axisLine={false}
               width={categoryWidth}
-              fontSize={11}
+              tick={tick}
               tickFormatter={formatX}
               interval={0}
             />
-            <ReferenceLine x={0} stroke="rgba(255,255,255,0.25)" />
+            <ReferenceLine x={0} stroke={chartTheme.zeroLine} strokeWidth={1.5} />
           </>
         ) : (
           <>
-            <XAxis dataKey="x" tickLine={false} axisLine={false} fontSize={11} tickFormatter={formatX} minTickGap={40} />
-            <YAxis tickLine={false} axisLine={false} fontSize={11} allowDecimals={false} />
+            <XAxis dataKey="x" tickLine={false} axisLine={false} tick={tick} tickFormatter={formatX} minTickGap={40} />
+            <YAxis tickLine={false} axisLine={false} tick={tick} allowDecimals={false} />
           </>
         )}
         {tooltip}
         <Bar dataKey="value" fill="var(--color-value)" radius={rows ? 3 : [3, 3, 0, 0]} isAnimationActive={false}>
           {colorOf && data.map((row, i) => <Cell key={i} fill={colorOf(row)} />)}
+          {showValues && rows && (
+            <LabelList
+              dataKey="value"
+              content={(props) => {
+                const x = Number(props.x);
+                const width = Number(props.width);
+                const value = Number(props.value);
+                const y = Number(props.y) + Number(props.height) / 2;
+                const negative = value < 0;
+                return (
+                  <text
+                    x={negative ? Math.min(x, x + width) - 4 : Math.max(x, x + width) + 4}
+                    y={y}
+                    dominantBaseline="central"
+                    textAnchor={negative ? "end" : "start"}
+                    {...tick}
+                    fill={chartTheme.textStrong}
+                  >
+                    {formatValue(value)}
+                  </text>
+                );
+              }}
+            />
+          )}
+          {showValues && !rows && (
+            <LabelList
+              dataKey="value"
+              position="top"
+              formatter={(v: unknown) => formatValue(Number(v))}
+              style={{ ...tick, fill: chartTheme.textStrong }}
+            />
+          )}
         </Bar>
       </BarChart>
     </ChartContainer>

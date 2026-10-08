@@ -1,7 +1,7 @@
 import "server-only";
 import { existsSync, statSync } from "node:fs";
 import path from "node:path";
-import { ROOT, lookupMarket, readEnvFile, readParquet } from "./data";
+import { ROOT, currentTokens, lookupMarket, readEnvFile, readParquet } from "./data";
 
 /** Same order as FEATURE_COLUMNS in src/microbot/model.py. */
 export const FEATURE_COLUMNS = [
@@ -16,7 +16,7 @@ export const FEATURE_COLUMNS = [
 ] as const;
 
 const SESSION_GAP_SECONDS = 60;
-const MAX_MINUTE_BUCKETS = 720;
+const MAX_BUCKETS = 720;
 const MIN_TRAINING_ROWS = 1000;
 const DEFAULT_HORIZON_SECONDS = 15;
 const DEFAULT_MIN_MOVE = 0.002;
@@ -26,6 +26,7 @@ type Row = Record<string, number | string>;
 export type TokenSummary = {
   token: string;
   label: string;
+  market: string | null;
   rows: number;
   first: number;
   last: number;
@@ -40,6 +41,10 @@ export type Session = { start: number; end: number; rows: number };
 
 export type FeatureStat = { name: string; mean: number; std: number; min: number; max: number };
 
+export type Resolution = "minute" | "hour" | "day";
+
+export type RowBucket = { ts: number; rows: number };
+
 export type FileInfo = { name: string; bytes: number; modifiedAt: number } | null;
 
 export type CollectionData = {
@@ -51,7 +56,7 @@ export type CollectionData = {
   exportedAt: number | null;
   tokens: TokenSummary[];
   sessions: Session[];
-  perMinute: { ts: number; rows: number }[];
+  rowsOverTime: Record<Resolution, RowBucket[]>;
   featureStats: FeatureStat[];
   training: {
     minRows: number;
@@ -89,22 +94,40 @@ function stats(values: number[]): Omit<FeatureStat, "name"> {
   return { mean, std: Math.sqrt(sq / values.length), min, max };
 }
 
+/**
+ * Rows per bucket, chronological (rows are sorted by ts). Buckets without rows between the first
+ * and last one are included with 0 so periods with the bot stopped show up as gaps.
+ */
+function countRows(rows: Row[], bucketOf: (ts: number) => number, next: (bucket: number) => number): RowBucket[] {
+  const buckets = new Map<number, number>();
+  for (const r of rows) {
+    const key = bucketOf(Number(r.ts));
+    buckets.set(key, (buckets.get(key) ?? 0) + 1);
+  }
+  const keys = [...buckets.keys()];
+  if (!keys.length) return [];
+  const out: RowBucket[] = [];
+  for (let ts = keys[0]; ts <= keys[keys.length - 1]; ts = next(ts)) out.push({ ts, rows: buckets.get(ts) ?? 0 });
+  return out.slice(-MAX_BUCKETS);
+}
+
+function nextLocalDay(ts: number) {
+  const d = new Date(ts * 1000);
+  d.setDate(d.getDate() + 1);
+  return d.getTime() / 1000;
+}
+
 export async function loadCollection(): Promise<CollectionData> {
   const env = readEnvFile();
   const dbPath = path.resolve(/*turbopackIgnore: true*/ ROOT, env.PM_DB_PATH || "data/microbot.duckdb");
   const parquetDir = path.resolve(/*turbopackIgnore: true*/ ROOT, env.PM_PARQUET_DIR || "data/parquet");
   const featuresFile = path.join(parquetDir, "features.parquet");
   const fillsFile = path.join(parquetDir, "fills.parquet");
-  const labels: Record<string, string> = {
-    [env.PM_YES_TOKEN_ID ?? ""]: "YES",
-    [env.PM_NO_TOKEN_ID ?? ""]: "NO",
-  };
-
-  const [rawRows, fills, market] = await Promise.all([
-    readParquet(featuresFile),
-    readParquet(fillsFile),
-    lookupMarket(env.PM_YES_TOKEN_ID ?? ""),
-  ]);
+  const [rawRows, fills] = await Promise.all([readParquet(featuresFile), readParquet(fillsFile)]);
+  const active = currentTokens(env, rawRows);
+  const market = await lookupMarket(active.yes);
+  const labels: Record<string, string> = { [active.yes]: "YES", [active.no]: "NO" };
+  const labelOf = (r: Row) => (r.outcome ? String(r.outcome) : labels[String(r.token_id)]);
   const rows = (rawRows as Row[])
     .map((r): Row & { ts: number } => ({ ...r, ts: Number(r.ts), token_id: String(r.token_id) }))
     .sort((a, b) => a.ts - b.ts);
@@ -120,7 +143,8 @@ export async function loadCollection(): Promise<CollectionData> {
     const mids = list.map((r) => Number(r.midpoint));
     return {
       token,
-      label: labels[token] ?? token.slice(0, 10),
+      label: labelOf(list[0]) ?? token.slice(0, 10),
+      market: list[0].market ? String(list[0].market) : null,
       rows: list.length,
       first: Number(list[0].ts),
       last: Number(list.at(-1)!.ts),
@@ -130,7 +154,7 @@ export async function loadCollection(): Promise<CollectionData> {
       maxMid: Math.max(...mids),
       lastMid: mids.at(-1)!,
     };
-  });
+  }).sort((a, b) => b.last - a.last);
 
   const sessions: Session[] = [];
   for (const r of rows) {
@@ -144,14 +168,12 @@ export async function loadCollection(): Promise<CollectionData> {
     }
   }
 
-  const buckets = new Map<number, number>();
-  for (const r of rows) {
-    const minute = Math.floor(Number(r.ts) / 60) * 60;
-    buckets.set(minute, (buckets.get(minute) ?? 0) + 1);
-  }
-  const perMinute = [...buckets.entries()]
-    .map(([ts, count]) => ({ ts, rows: count }))
-    .slice(-MAX_MINUTE_BUCKETS);
+  const rowsOverTime: Record<Resolution, RowBucket[]> = {
+    minute: countRows(rows, (ts) => Math.floor(ts / 60) * 60, (b) => b + 60),
+    hour: countRows(rows, (ts) => Math.floor(ts / 3600) * 3600, (b) => b + 3600),
+    // Local midnight, so days match the calendar of the machine running the bot.
+    day: countRows(rows, (ts) => new Date(ts * 1000).setHours(0, 0, 0, 0) / 1000, nextLocalDay),
+  };
 
   const featureStats = FEATURE_COLUMNS.map((name) => ({
     name,
@@ -191,7 +213,7 @@ export async function loadCollection(): Promise<CollectionData> {
     exportedAt: featuresInfo?.modifiedAt ?? null,
     tokens,
     sessions: sessions.reverse(),
-    perMinute,
+    rowsOverTime,
     featureStats,
     training: {
       minRows: MIN_TRAINING_ROWS,
@@ -204,6 +226,6 @@ export async function loadCollection(): Promise<CollectionData> {
       downs,
     },
     files: [dbPath, `${dbPath}.wal`, featuresFile, fillsFile].map(fileInfo),
-    recent: rows.slice(-50).reverse().map((r) => ({ ...r, token_id: labels[String(r.token_id)] ?? String(r.token_id) })),
+    recent: rows.slice(-50).reverse().map((r) => ({ ...r, token_id: labelOf(r) ?? String(r.token_id) })),
   };
 }

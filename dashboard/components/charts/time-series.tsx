@@ -4,8 +4,10 @@ import { useEffect, useRef, useState } from "react";
 import {
   AreaSeries,
   BaselineSeries,
+  CandlestickSeries,
   ColorType,
   CrosshairMode,
+  HistogramSeries,
   LineSeries,
   LineStyle,
   createChart,
@@ -20,8 +22,15 @@ import {
   type Time,
   type UTCTimestamp,
 } from "lightweight-charts";
+import type { Candle } from "./candles";
+import { type ChartViewport, type GroupMember, useChartGroup } from "./chart-group";
 
-export type TimePoint = { ts: number; value: number };
+const DEFAULT_VIEWPORT: ChartViewport = { windowSec: Infinity, following: true, onFollowingChange: () => {} };
+import { cn } from "@/lib/utils";
+import { type Separator, SeparatorsPrimitive } from "./separators";
+import { type ChartTheme, useChartTheme, withAlpha } from "./theme";
+
+export type TimePoint = { ts: number; value: number; color?: string };
 
 export type ChartMarker = {
   ts: number;
@@ -30,24 +39,27 @@ export type ChartMarker = {
   text?: string;
 };
 
-export type ChartSeries = {
+type BaseSeries = {
   id: string;
   label: string;
-  type: "line" | "area" | "baseline";
   color: string;
-  data: TimePoint[];
+  /** 0 = main pane, 1 = lower pane (e.g. volume). */
+  pane?: 0 | 1;
+  /** Decimals for this series; defaults to the chart's `precision`. */
+  precision?: number;
   lineWidth?: 1 | 2 | 3;
   dashed?: boolean;
-  /** Baseline series: values above are green, below red. */
-  baseValue?: number;
   priceLines?: { price: number; color: string; title?: string }[];
   markers?: ChartMarker[];
   /** Hidden from the legend (still drawn). */
   hideInLegend?: boolean;
 };
 
-const UP = "#22c55e";
-const DOWN = "#ef4444";
+export type ChartSeries =
+  | (BaseSeries & { type: "line" | "area" | "histogram"; data: TimePoint[] })
+  /** Baseline: values above `baseValue` are green, below red. */
+  | (BaseSeries & { type: "baseline"; data: TimePoint[]; baseValue?: number })
+  | (BaseSeries & { type: "candles"; data: Candle[] });
 
 const timeLabel = (time: Time, withSeconds = true) =>
   new Date((time as number) * 1000).toLocaleTimeString("es", {
@@ -57,21 +69,36 @@ const timeLabel = (time: Time, withSeconds = true) =>
     ...(withSeconds ? { second: "2-digit" } : {}),
   });
 
+const tickLabel = (time: Time, tickType: number) => {
+  const date = new Date((time as number) * 1000);
+  // TickMarkType: 0 year, 1 month, 2 day of month, 3 time, 4 time with seconds.
+  if (tickType <= 2) return date.toLocaleDateString("es", { day: "2-digit", month: "short" });
+  return timeLabel(time, tickType === 4);
+};
+
+const fullTime = (ts: number, format?: (ts: number) => string) =>
+  format?.(ts) ?? new Date(ts * 1000).toLocaleString("es", { hour12: false, dateStyle: "short", timeStyle: "medium" });
+
 /** Whole seconds, strictly increasing, keeping the last value of each second. */
-function toSeriesData(points: TimePoint[]) {
-  const out: { time: UTCTimestamp; value: number }[] = [];
+function toLineData(points: TimePoint[]) {
+  const out: { time: UTCTimestamp; value: number; color?: string }[] = [];
   for (const p of points) {
     if (!Number.isFinite(p.value) || !Number.isFinite(p.ts)) continue;
     const time = Math.floor(p.ts) as UTCTimestamp;
+    const point = p.color ? { time, value: p.value, color: p.color } : { time, value: p.value };
     const last = out.at(-1);
-    if (last && last.time === time) last.value = p.value;
-    else if (!last || time > last.time) out.push({ time, value: p.value });
+    if (last && last.time === time) out[out.length - 1] = point;
+    else if (!last || time > last.time) out.push(point);
   }
   return out;
 }
 
+function toCandleData(candles: Candle[]) {
+  return candles.map((c) => ({ time: c.ts as UTCTimestamp, open: c.open, high: c.high, low: c.low, close: c.close }));
+}
+
 /** Markers must sit on an existing bar, so snap each one to the nearest data time. */
-function toMarkers(markers: ChartMarker[], times: UTCTimestamp[]): SeriesMarker<Time>[] {
+function toMarkers(markers: ChartMarker[], times: UTCTimestamp[], T: ChartTheme): SeriesMarker<Time>[] {
   if (!times.length) return [];
   return markers
     .map((m) => {
@@ -89,7 +116,7 @@ function toMarkers(markers: ChartMarker[], times: UTCTimestamp[]): SeriesMarker<
         price: m.price,
         position: buy ? "atPriceBottom" : "atPriceTop",
         shape: buy ? "arrowUp" : "arrowDown",
-        color: buy ? "#22d3ee" : "#f97316",
+        color: buy ? T.buy : T.sell,
         text: m.text,
       } satisfies SeriesMarker<Time>;
     })
@@ -97,36 +124,124 @@ function toMarkers(markers: ChartMarker[], times: UTCTimestamp[]): SeriesMarker<
 }
 
 type Entry = {
-  type: ChartSeries["type"];
+  key: string;
   api: ISeriesApi<SeriesType>;
   markers: ISeriesMarkersPluginApi<Time> | null;
   priceLines: IPriceLine[];
 };
 
-type Legend = { time: Time | null; values: Record<string, number | undefined> };
+type Ohlc = { open: number; high: number; low: number; close: number };
+type Legend = { time: Time | null; values: Record<string, number | Ohlc | undefined> };
+
+const shapeKey = (s: ChartSeries) => `${s.type}:${s.pane ?? 0}`;
+
+/** Theme- and series-dependent colours, applied at creation and again when either changes. */
+function colorOptions(s: ChartSeries, T: ChartTheme): object {
+  switch (s.type) {
+    case "candles":
+      return {
+        upColor: T.up,
+        downColor: T.down,
+        borderUpColor: T.up,
+        borderDownColor: T.down,
+        wickUpColor: T.up,
+        wickDownColor: T.down,
+      };
+    case "area":
+      return { lineColor: s.color, topColor: withAlpha(s.color, 0.3), bottomColor: withAlpha(s.color, 0.02) };
+    case "baseline":
+      return {
+        baseValue: { type: "price", price: s.baseValue ?? 0 },
+        topLineColor: T.up,
+        topFillColor1: withAlpha(T.up, 0.25),
+        topFillColor2: withAlpha(T.up, 0.02),
+        bottomLineColor: T.down,
+        bottomFillColor1: withAlpha(T.down, 0.02),
+        bottomFillColor2: withAlpha(T.down, 0.25),
+      };
+    default:
+      return { color: s.color };
+  }
+}
+
+const SERIES_DEFINITIONS = {
+  candles: CandlestickSeries,
+  histogram: HistogramSeries,
+  area: AreaSeries,
+  baseline: BaselineSeries,
+  line: LineSeries,
+} as const;
+
+function addSeries(chart: IChartApi, s: ChartSeries, options: object): ISeriesApi<SeriesType> {
+  return chart.addSeries(SERIES_DEFINITIONS[s.type] as typeof LineSeries, options, s.pane ?? 0) as ISeriesApi<SeriesType>;
+}
+
+function formatLegendValue(value: number | Ohlc | undefined, precision: number, T: ChartTheme) {
+  if (value === undefined) return "—";
+  if (typeof value === "number") return Number.isFinite(value) ? value.toFixed(precision) : "—";
+  const change = value.close - value.open;
+  return (
+    <>
+      <span className="text-muted-foreground">O</span> {value.open.toFixed(precision)}{" "}
+      <span className="text-muted-foreground">H</span> {value.high.toFixed(precision)}{" "}
+      <span className="text-muted-foreground">L</span> {value.low.toFixed(precision)}{" "}
+      <span className="text-muted-foreground">C</span>{" "}
+      <span style={{ color: change > 0 ? T.up : change < 0 ? T.down : undefined }}>{value.close.toFixed(precision)}</span>
+    </>
+  );
+}
+
+function lastValue(s: ChartSeries): number | Ohlc | undefined {
+  const last = s.data.at(-1);
+  if (!last) return undefined;
+  return "close" in last ? last : last.value;
+}
 
 export function TimeSeries({
   series,
   height = 260,
+  className,
   precision = 3,
   fitKey,
+  separators,
+  lowerPaneRatio = 0.22,
+  formatTick,
+  formatTime,
+  viewport,
 }: {
   series: ChartSeries[];
   height?: number;
+  /** Sizing classes (e.g. `h-64 md:h-96`); replaces `height` so it can change per breakpoint. */
+  className?: string;
   precision?: number;
-  /** Changing this value refits the visible range to the data. */
+  /** Outside a ChartGroup: changing this value refits the visible range to the data. */
   fitKey?: string | number;
+  /** Dashed vertical lines, e.g. market rollovers. */
+  separators?: Separator[];
+  /** Share of the height for pane 1 when a series uses it. */
+  lowerPaneRatio?: number;
+  /** Axis tick labels; defaults to time of day, or the date at day boundaries. */
+  formatTick?: (ts: number) => string;
+  /** Crosshair and legend label; defaults to date and time with seconds. */
+  formatTime?: (ts: number) => string;
+  /** Inside a ChartGroup: this chart's own window; defaults to all data, always following. */
+  viewport?: ChartViewport;
 }) {
+  const group = useChartGroup();
+  const T = useChartTheme();
+  const formatters = useRef({ formatTick, formatTime });
+  const viewportRef = useRef(viewport ?? DEFAULT_VIEWPORT);
+  useEffect(() => {
+    formatters.current = { formatTick, formatTime };
+    viewportRef.current = viewport ?? DEFAULT_VIEWPORT;
+  });
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
+  const memberRef = useRef<GroupMember | null>(null);
   const entriesRef = useRef(new Map<string, Entry>());
-  const seriesRef = useRef(series);
+  const separatorsRef = useRef<{ primitive: SeparatorsPrimitive; host: ISeriesApi<SeriesType> } | null>(null);
   const fittedKeyRef = useRef<string | number | undefined>(undefined);
   const [legend, setLegend] = useState<Legend>({ time: null, values: {} });
-
-  useEffect(() => {
-    seriesRef.current = series;
-  });
 
   useEffect(() => {
     const el = containerRef.current;
@@ -135,28 +250,25 @@ export function TimeSeries({
       autoSize: true,
       layout: {
         background: { type: ColorType.Solid, color: "transparent" },
-        textColor: "#a1a1aa",
-        fontSize: 11,
-        fontFamily: "var(--font-geist-mono), ui-monospace, monospace",
         attributionLogo: false,
-      },
-      grid: {
-        vertLines: { color: "rgba(255,255,255,0.04)" },
-        horzLines: { color: "rgba(255,255,255,0.06)" },
+        panes: { enableResize: true },
       },
       crosshair: {
         mode: CrosshairMode.Normal,
-        vertLine: { color: "rgba(255,255,255,0.25)", labelBackgroundColor: "#27272a" },
-        horzLine: { color: "rgba(255,255,255,0.25)", labelBackgroundColor: "#27272a" },
+        vertLine: { style: LineStyle.Dashed },
+        horzLine: { style: LineStyle.Dashed },
       },
-      rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.12, bottom: 0.08 } },
+      rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.12, bottom: 0.08 }, minimumWidth: 64 },
       timeScale: {
         borderVisible: false,
         timeVisible: true,
         secondsVisible: true,
-        tickMarkFormatter: (time: Time) => timeLabel(time, false),
+        rightOffset: 4,
+        shiftVisibleRangeOnNewBar: false,
+        tickMarkFormatter: (time: Time, tickType: number) =>
+          formatters.current.formatTick?.(time as number) ?? tickLabel(time, tickType),
       },
-      localization: { timeFormatter: (time: Time) => timeLabel(time) },
+      localization: { timeFormatter: (time: Time) => fullTime(time as number, formatters.current.formatTime) },
     });
     chartRef.current = chart;
     const entries = entriesRef.current;
@@ -168,8 +280,8 @@ export function TimeSeries({
       }
       const values: Legend["values"] = {};
       for (const [id, entry] of entries) {
-        const point = param.seriesData.get(entry.api) as { value?: number } | undefined;
-        values[id] = point?.value;
+        const point = param.seriesData.get(entry.api) as ({ value?: number } & Partial<Ohlc>) | undefined;
+        values[id] = point?.close !== undefined ? (point as Ohlc) : point?.value;
       }
       setLegend({ time: param.time, values });
     };
@@ -180,19 +292,65 @@ export function TimeSeries({
       chart.remove();
       chartRef.current = null;
       entries.clear();
+      separatorsRef.current = null;
       fittedKeyRef.current = undefined;
     };
   }, []);
 
   useEffect(() => {
+    chartRef.current?.applyOptions({
+      layout: {
+        textColor: T.text,
+        fontSize: T.fontSize,
+        fontFamily: T.font,
+        panes: { separatorColor: T.gridStrong, separatorHoverColor: T.paneHover },
+      },
+      grid: { vertLines: { color: T.grid }, horzLines: { color: T.grid } },
+      crosshair: {
+        vertLine: { color: T.crosshair, labelBackgroundColor: T.labelBg },
+        horzLine: { color: T.crosshair, labelBackgroundColor: T.labelBg },
+      },
+    });
+  }, [T]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    const el = containerRef.current;
+    if (!chart || !el || !group) return;
+    const member: GroupMember = {
+      chart,
+      element: el,
+      mainSeries: () => entriesRef.current.values().next().value?.api ?? null,
+      viewport: () => viewportRef.current,
+    };
+    memberRef.current = member;
+    const unregister = group.register(member);
+    return () => {
+      unregister();
+      memberRef.current = null;
+    };
+  }, [group]);
+
+  const windowSec = viewport?.windowSec;
+  const following = viewport?.following;
+  useEffect(() => {
+    if (memberRef.current && group) group.refresh(memberRef.current);
+  }, [group, windowSec, following]);
+
+  useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
     const entries = entriesRef.current;
-    const priceFormat = { type: "price" as const, precision, minMove: 10 ** -precision };
+    const previousRange = chart.timeScale().getVisibleRange();
 
     for (const [id, entry] of entries) {
       const next = series.find((s) => s.id === id);
-      if (!next || next.type !== entry.type) {
+      if (!next || shapeKey(next) !== entry.key) {
+        entry.markers?.detach();
+        if (separatorsRef.current?.host === entry.api) {
+          entry.api.detachPrimitive(separatorsRef.current.primitive);
+          separatorsRef.current = null;
+        }
         chart.removeSeries(entry.api);
         entries.delete(id);
       }
@@ -200,50 +358,31 @@ export function TimeSeries({
 
     let hasData = false;
     for (const s of series) {
-      let entry = entries.get(s.id);
+      const digits = s.precision ?? precision;
       const common = {
         lineWidth: s.lineWidth ?? 2,
         lineStyle: s.dashed ? LineStyle.Dashed : LineStyle.Solid,
-        priceFormat,
+        priceFormat: { type: "price" as const, precision: digits, minMove: 10 ** -digits },
         lastValueVisible: !s.hideInLegend,
         priceLineVisible: false,
       };
+      const options = { ...common, ...colorOptions(s, T) };
+      let entry = entries.get(s.id);
       if (!entry) {
-        const api =
-          s.type === "area"
-            ? chart.addSeries(AreaSeries, {
-                ...common,
-                lineColor: s.color,
-                topColor: `${s.color}55`,
-                bottomColor: `${s.color}05`,
-              })
-            : s.type === "baseline"
-              ? chart.addSeries(BaselineSeries, {
-                  ...common,
-                  baseValue: { type: "price", price: s.baseValue ?? 0 },
-                  topLineColor: UP,
-                  topFillColor1: `${UP}40`,
-                  topFillColor2: `${UP}05`,
-                  bottomLineColor: DOWN,
-                  bottomFillColor1: `${DOWN}05`,
-                  bottomFillColor2: `${DOWN}40`,
-                })
-              : chart.addSeries(LineSeries, { ...common, color: s.color });
-        entry = { type: s.type, api, markers: null, priceLines: [] };
+        entry = { key: shapeKey(s), api: addSeries(chart, s, options), markers: null, priceLines: [] };
         entries.set(s.id, entry);
-      } else if (s.type === "baseline") {
-        entry.api.applyOptions({ ...common, baseValue: { type: "price", price: s.baseValue ?? 0 } });
       } else {
-        entry.api.applyOptions(s.type === "area" ? { ...common, lineColor: s.color } : { ...common, color: s.color });
+        entry.api.applyOptions(options);
       }
 
-      const data = toSeriesData(s.data);
+      const data = s.type === "candles" ? toCandleData(s.data) : toLineData(s.data);
       hasData ||= data.length > 0;
       entry.api.setData(data);
 
       for (const line of entry.priceLines) entry.api.removePriceLine(line);
+      const api = entry.api;
       entry.priceLines = (s.priceLines ?? []).map((line) =>
-        entry.api.createPriceLine({
+        api.createPriceLine({
           price: line.price,
           color: line.color,
           lineWidth: 1,
@@ -253,34 +392,53 @@ export function TimeSeries({
         }),
       );
 
-      const markers = toMarkers(s.markers ?? [], data.map((d) => d.time));
+      const markers = toMarkers(s.markers ?? [], data.map((d) => d.time), T);
       if (entry.markers) entry.markers.setMarkers(markers);
       else if (markers.length) entry.markers = createSeriesMarkers(entry.api, markers);
     }
 
-    const key = fitKey ?? "default";
-    if (hasData && fittedKeyRef.current !== key) {
-      chart.timeScale().fitContent();
-      fittedKeyRef.current = key;
+    const panes = chart.panes();
+    if (panes.length > 1) {
+      panes[0].setStretchFactor(1 - lowerPaneRatio);
+      panes[1].setStretchFactor(lowerPaneRatio);
     }
-  }, [series, precision, fitKey]);
+
+    const host = entries.values().next().value?.api;
+    if (host && separatorsRef.current?.host !== host) {
+      const primitive = new SeparatorsPrimitive();
+      host.attachPrimitive(primitive);
+      separatorsRef.current = { primitive, host };
+    }
+    separatorsRef.current?.primitive.setLines(separators ?? [], T);
+
+    if (memberRef.current && group) {
+      group.afterData(memberRef.current, previousRange);
+    } else {
+      const key = fitKey ?? "default";
+      if (hasData && fittedKeyRef.current !== key) {
+        chart.timeScale().fitContent();
+        fittedKeyRef.current = key;
+      }
+    }
+  }, [series, precision, fitKey, separators, lowerPaneRatio, group, T]);
 
   const legendSeries = series.filter((s) => !s.hideInLegend);
   const hovering = legend.time !== null;
   return (
-    <div className="relative w-full" style={{ height }}>
+    <div className={cn("relative w-full", className)} style={className ? undefined : { height }}>
       <div ref={containerRef} className="absolute inset-0" />
-      <div className="pointer-events-none absolute left-2 top-1 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[11px]">
-        {hovering && <span className="text-zinc-500">{timeLabel(legend.time as Time)}</span>}
+      <div className="pointer-events-none absolute left-1 right-20 top-1 z-10 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[11px]">
+        {hovering && <span className="text-muted-foreground">{fullTime(legend.time as number, formatTime)}</span>}
         {legendSeries.map((s) => {
-          const value = hovering ? legend.values[s.id] : s.data.at(-1)?.value;
+          const value = hovering ? legend.values[s.id] : lastValue(s);
           return (
             <span key={s.id} className="flex items-center gap-1">
-              <span className="h-2 w-2 rounded-full" style={{ background: s.type === "baseline" ? UP : s.color }} />
-              <span className="text-zinc-400">{s.label}</span>
-              <span className="tabular-nums text-zinc-100">
-                {value === undefined || !Number.isFinite(value) ? "—" : value.toFixed(precision)}
-              </span>
+              <span
+                className="h-2 w-2 rounded-full"
+                style={{ background: s.type === "baseline" ? T.up : s.type === "candles" ? T.textStrong : s.color }}
+              />
+              <span className="text-muted-foreground">{s.label}</span>
+              <span className="tabular-nums text-foreground">{formatLegendValue(value, s.precision ?? precision, T)}</span>
             </span>
           );
         })}
