@@ -26,6 +26,18 @@ PM_NO_TOKEN_ID=...
 PM_MODE=paper
 ```
 
+Para mercados que se renuevan (BTC/ETH/SOL/XRP "Up or Down" de 5 min, 15 min o por hora), usa la serie
+en lugar de los token IDs. El bot busca el mercado abierto de la serie en la Gamma API, lo sigue hasta
+`PM_ROLLOVER_SECONDS` (30 s) antes del cierre, vende las posiciones abiertas (motivo `rollover`) y pasa
+al siguiente:
+
+```dotenv
+PM_SERIES_SLUG=btc-up-or-down-15m   # o btc-up-or-down-5m, btc-up-or-down-hourly, eth-up-or-down-15m…
+```
+
+Cada fila de `features` y `fills` guarda el `market` (slug) y el `outcome` (`YES` = primer resultado,
+p. ej. "Up"; `NO` = segundo).
+
 Ejecuta:
 
 ```bash

@@ -11,12 +11,13 @@ SCHEMAS: dict[str, list[tuple[str, str]]] = {
         ("microprice_delta", "DOUBLE"), ("flow_imbalance", "DOUBLE"), ("trade_pressure", "DOUBLE"),
         ("score", "DOUBLE"), ("weighted_imbalance", "DOUBLE"), ("ofi", "DOUBLE"),
         ("volatility", "DOUBLE"), ("spread_ticks", "DOUBLE"), ("top_bid_size", "DOUBLE"),
-        ("top_ask_size", "DOUBLE"),
+        ("top_ask_size", "DOUBLE"), ("trade_volume", "DOUBLE"), ("market", "VARCHAR"),
+        ("outcome", "VARCHAR"),
     ],
     "fills": [
         ("ts", "DOUBLE"), ("token_id", "VARCHAR"), ("side", "VARCHAR"), ("size", "DOUBLE"),
         ("price", "DOUBLE"), ("fee", "DOUBLE"), ("order_id", "VARCHAR"), ("mode", "VARCHAR"),
-        ("reason", "VARCHAR"), ("pnl", "DOUBLE"),
+        ("reason", "VARCHAR"), ("pnl", "DOUBLE"), ("market", "VARCHAR"), ("outcome", "VARCHAR"),
     ],
 }
 

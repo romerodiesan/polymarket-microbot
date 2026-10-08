@@ -10,6 +10,9 @@ class Settings(BaseSettings):
 
     yes_token_id: str = ""
     no_token_id: str = ""
+    # Rolling series (e.g. btc-up-or-down-15m): follows the current market instead of fixed tokens.
+    series_slug: str = ""
+    rollover_seconds: float = Field(30.0, ge=0)
     mode: Literal["record", "paper", "live"] = "paper"
     ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     clob_host: str = "https://clob.polymarket.com"
@@ -67,9 +70,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime(self):
-        if not self.yes_token_id or not self.no_token_id:
-            raise ValueError("PM_YES_TOKEN_ID and PM_NO_TOKEN_ID are required")
-        if self.yes_token_id == self.no_token_id:
+        if not self.series_slug and (not self.yes_token_id or not self.no_token_id):
+            raise ValueError("Set PM_SERIES_SLUG or both PM_YES_TOKEN_ID and PM_NO_TOKEN_ID")
+        if not self.series_slug and self.yes_token_id == self.no_token_id:
             raise ValueError("YES and NO token IDs must be different")
         if self.min_price >= self.max_price:
             raise ValueError("PM_MIN_PRICE must be lower than PM_MAX_PRICE")
