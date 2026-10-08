@@ -1,0 +1,38 @@
+# Secrets: only the template is versioned.
+.env
+.env.*
+!.env.example
+
+# Python virtualenvs
+.bot/
+.venv/
+venv/
+
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Bot output: database, Parquet exports, models and training runs
+/data/
+*.duckdb
+*.duckdb.wal
+*.parquet
+*.joblib
+*.log
+
+# Node (the dashboard has its own .gitignore too)
+node_modules/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
