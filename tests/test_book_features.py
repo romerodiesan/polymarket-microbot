@@ -89,6 +89,15 @@ def test_score_needs_warmup_then_reacts_to_bid_pressure():
     assert row.score > 0.3
 
 
+def test_trade_volume_counts_shares_since_previous_row():
+    engine = FeatureEngine()
+    book = make_book()
+    engine.on_trade("yes", "BUY", 3, 1.0)
+    engine.on_trade("yes", "SELL", 2, 1.5)
+    assert engine.calculate(book, now=2.0).trade_volume == 5
+    assert engine.calculate(book, now=3.0).trade_volume == 0
+
+
 def _row(token: str, score: float) -> FeatureRow:
     return FeatureRow(0, token, .49, .51, .50, .02, 20, 20, 0, .5, 0, 0, 0, score)
 

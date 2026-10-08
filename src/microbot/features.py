@@ -33,6 +33,8 @@ class FeatureRow:
     spread_ticks: float = 0.0
     top_bid_size: float = 0.0
     top_ask_size: float = 0.0
+    # Shares traded since the previous row; for charts, not a model feature.
+    trade_volume: float = 0.0
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -96,6 +98,7 @@ class _TokenState:
     prev_mid: float | None = None
     prev_ts: float | None = None
     vol_var: float = 0.0
+    traded: float = 0.0
 
 
 SCORE_COMPONENTS = ("weighted_imbalance", "ofi", "trade_pressure", "microprice_delta")
@@ -140,7 +143,9 @@ class FeatureEngine:
 
     def on_trade(self, token_id: str, side: str, size: float, now: float | None = None) -> None:
         signed = size if side.upper() == "BUY" else -size
-        self._token(token_id).pressure.add(signed, now or time())
+        st = self._token(token_id)
+        st.pressure.add(signed, now or time())
+        st.traded += abs(size)
 
     def calculate(self, book: OrderBook, now: float | None = None) -> FeatureRow | None:
         now = now or time()
@@ -188,6 +193,7 @@ class FeatureEngine:
         }
         raw = sum(self.weights[c] * st.zscores[c].update(v, now) for c, v in values.items())
         score = math.tanh(raw)
+        traded, st.traded = st.traded, 0.0
 
         return FeatureRow(
             ts=now, token_id=book.token_id, best_bid=bid, best_ask=ask,
@@ -197,7 +203,7 @@ class FeatureEngine:
             trade_pressure=pressure, score=score,
             weighted_imbalance=weighted_imbalance, ofi=ofi, volatility=volatility,
             spread_ticks=spread / book.tick_size if book.tick_size else 0.0,
-            top_bid_size=top_bid, top_ask_size=top_ask,
+            top_bid_size=top_bid, top_ask_size=top_ask, trade_volume=traded,
         )
 
 
