@@ -13,6 +13,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { ROOT, readEnvFile } from "./data";
+import { pythonBin } from "./env";
 
 const RUNS_DIR = path.join(/*turbopackIgnore: true*/ ROOT, "data", "training");
 const LOG_TAIL_BYTES = 64 * 1024;
@@ -80,15 +81,6 @@ function isAlive(pid: number | null) {
   } catch {
     return false;
   }
-}
-
-function pythonBin() {
-  if (process.env.MICROBOT_PYTHON) return process.env.MICROBOT_PYTHON;
-  for (const venv of [".bot", ".venv"]) {
-    const candidate = path.join(ROOT, venv, "bin", "python");
-    if (existsSync(candidate)) return candidate;
-  }
-  return "python3";
 }
 
 function finalize(id: string, exitCode: number | null) {

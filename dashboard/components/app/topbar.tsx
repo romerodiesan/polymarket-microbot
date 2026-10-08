@@ -3,14 +3,12 @@
 import { usePathname } from "next/navigation";
 import { Separator } from "@/components/ui/separator";
 import { SidebarTrigger } from "@/components/ui/sidebar";
-import { useBotStatus } from "@/hooks/use-bot-status";
-import { StatusDot, ToneBadge } from "./indicators";
+import { BotControl } from "./bot-control";
 import { NAV_LINKS, isActiveLink } from "./nav-links";
 import { ThemeToggle } from "./theme-toggle";
 
 export function Topbar() {
   const pathname = usePathname();
-  const { mode, lagSeconds, running } = useBotStatus();
   const title = NAV_LINKS.find((l) => isActiveLink(l.href, pathname))?.label ?? "Microbot";
 
   return (
@@ -19,23 +17,7 @@ export function Topbar() {
       <Separator orientation="vertical" className="mr-1 data-[orientation=vertical]:h-4" />
       <span className="truncate text-sm font-medium">{title}</span>
       <div className="ml-auto flex items-center gap-2">
-        {mode && (
-          <ToneBadge tone={mode === "live" ? "red" : "neutral"} className="font-mono uppercase">
-            {mode}
-          </ToneBadge>
-        )}
-        {lagSeconds !== null && (
-          <span
-            className="flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs"
-            title={`Último export hace ${Math.round(lagSeconds)} s`}
-          >
-            <StatusDot active={running} />
-            <span>{running ? "Activo" : "Detenido"}</span>
-            <span className="hidden font-mono tabular-nums text-muted-foreground sm:inline">
-              {Math.round(lagSeconds)}s
-            </span>
-          </span>
-        )}
+        <BotControl />
         <ThemeToggle />
       </div>
     </header>

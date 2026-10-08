@@ -14,3 +14,16 @@ export function readEnvFile(): Record<string, string> {
   }
   return env;
 }
+
+/** An executable from the project's virtualenv (.bot or .venv), or null when there is none. */
+export function venvBin(name: string): string | null {
+  for (const venv of [".bot", ".venv"]) {
+    const candidate = path.join(/*turbopackIgnore: true*/ ROOT, venv, "bin", name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+export function pythonBin(): string {
+  return process.env.MICROBOT_PYTHON || venvBin("python") || "python3";
+}
