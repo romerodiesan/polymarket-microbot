@@ -1,12 +1,15 @@
 import { connection } from "next/server";
 import { listRuns, startRun } from "@/lib/training";
+import { hasSession, unauthorizedResponse } from "@/lib/session";
 
 export async function GET() {
+  if (!(await hasSession())) return unauthorizedResponse();
   await connection();
   return Response.json(listRuns());
 }
 
 export async function POST(request: Request) {
+  if (!(await hasSession())) return unauthorizedResponse();
   const body = await request.json().catch(() => ({}));
   const horizonSeconds = Number(body.horizonSeconds ?? 15);
   const minMove = Number(body.minMove ?? 0.002);
