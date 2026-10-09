@@ -112,6 +112,43 @@ entre entrenamiento y test para que las etiquetas no se filtren. Solo usa filas 
 features actual. El reporte muestra ROC-AUC, precision y recall fuera de muestra y la precisión en las
 predicciones de alta confianza; eso todavía no equivale a rentabilidad.
 
+## Servidor MCP de analítica
+
+`microbot-mcp` expone los datos del bot a un agente (Cursor, Claude, etc.) por stdio, **solo en lectura**:
+consulta los Parquet exportados con DuckDB en memoria (sin bloquear `microbot.duckdb`), el estado del
+proceso en `data/bot/state.json` y las ejecuciones de `data/training/`. Del `.env` solo expone `PM_MODE` y
+`PM_SERIES_SLUG`.
+
+```bash
+cd bot
+pip install -e '.[mcp]'
+```
+
+| Herramienta | Devuelve |
+| --- | --- |
+| `get_capture_status` | Proceso, frescura del export, filas y tamaño de los Parquet, número de entrenamientos |
+| `get_market_summary` | Midpoint, spread (media y p95), profundidad y señales por token |
+| `get_recent_features` | Últimas observaciones (máximo `MICROBOT_MCP_MAX_ROWS`, 500) |
+| `get_data_quality` | Intervalos de muestreo, huecos y timestamps duplicados |
+| `get_paper_performance` | Fills paper, posición, comisiones, PnL realizado, PnL marcado al último mid y fills por motivo |
+| `list_training_runs` / `get_training_run` / `compare_training_runs` | Parámetros, datos, métricas y coeficientes de cada entrenamiento |
+
+El repo incluye `.cursor/mcp.json`, que lo registra en Cursor con el virtualenv `bot/.bot`. La carpeta de
+datos se toma de `MICROBOT_DATA_DIR` o, si no está, de `bot/data`.
+
+Para consultar el bot de un VPS sin abrir puertos, lanza el servidor por SSH (stdio sobre la conexión):
+
+```json
+{
+  "mcpServers": {
+    "microbot-vps": {
+      "command": "ssh",
+      "args": ["usuario@vps", "/ruta/al/repo/bot/.bot/bin/microbot-mcp"]
+    }
+  }
+}
+```
+
 ## Modos
 
 - `record`: captura y calcula features sin operar.
@@ -206,5 +243,6 @@ bot/src/microbot/storage.py    DuckDB y exportación Parquet
 bot/src/microbot/ws.py         WebSocket y reconexión
 bot/src/microbot/main.py       orquestación
 bot/src/microbot/train.py      entrenamiento del modelo base
+bot/src/microbot/mcp_server.py servidor MCP de analítica (solo lectura)
 dashboard/                     app Next.js (en vivo, datos, entrenamiento, control del bot)
 ```

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "microbot-analytics": {
+      "command": "${workspaceFolder}/bot/.bot/bin/microbot-mcp",
+      "env": {
+        "MICROBOT_DATA_DIR": "${workspaceFolder}/bot/data"
+      }
+    }
+  }
+}
