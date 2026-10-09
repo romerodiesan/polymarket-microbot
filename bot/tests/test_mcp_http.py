@@ -181,6 +181,9 @@ def test_login_page_and_wrong_password(client):
     assert "ChatGPT" in page.text and "chatgpt.com" in page.text
     assert page.headers["cache-control"] == "no-store"
     assert page.headers["x-frame-options"] == "DENY"
+    assert page.headers["content-security-policy"].endswith(
+        "form-action 'self' https://chatgpt.com"
+    )
 
     assert login(client, request_id, "wrong").status_code == 401
     assert login(client, "unknown").status_code == 400

@@ -270,10 +270,12 @@ font-weight:600;cursor:pointer}}.error{{color:#f87171}}
 <button type="submit">Autorizar</button>
 </form></body></html>"""
 
+CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+
 HEADERS = {
     "Cache-Control": "no-store",
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    "Content-Security-Policy": CSP,
     "Referrer-Policy": "no-referrer",
 }
 
@@ -282,13 +284,20 @@ def render(
     login: PendingLogin, request_id: str, error: str = "", status: int = 200
 ) -> HTMLResponse:
     client = login.client.client_name or login.client.client_id
+    redirect = urlparse(str(login.params.redirect_uri))
     body = PAGE.format(
         client=html.escape(client),
-        host=html.escape(urlparse(str(login.params.redirect_uri)).netloc),
+        host=html.escape(redirect.netloc),
         request=html.escape(request_id),
         error=f'<p class="error">{html.escape(error)}</p>' if error else "",
     )
-    return HTMLResponse(body, status_code=status, headers=HEADERS)
+    # Browsers apply form-action to the redirect that follows the POST, so the client's
+    # (registered) redirect origin must be allowed too.
+    headers = {
+        **HEADERS,
+        "Content-Security-Policy": f"{CSP} {redirect.scheme}://{redirect.netloc}",
+    }
+    return HTMLResponse(body, status_code=status, headers=headers)
 
 
 def expired() -> Response:
