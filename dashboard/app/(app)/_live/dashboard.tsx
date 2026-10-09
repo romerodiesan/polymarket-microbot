@@ -5,38 +5,53 @@ import { useEffect, useMemo, useState } from "react";
 import { ToneBadge } from "@/components/app/indicators";
 import { Kpi, KpiGrid } from "@/components/app/kpi";
 import { EmptyState, Notice, Page, PageHeader, PageSkeleton, Panel } from "@/components/app/page";
+import { type Candle, candleSeries } from "@/components/charts/candles";
 import { ChartGroup } from "@/components/charts/chart-group";
 import type { Separator } from "@/components/charts/separators";
 import { useChartTheme } from "@/components/charts/theme";
 import { type ChartSeries, TimeSeries } from "@/components/charts/time-series";
-import type { BotData } from "@/lib/data";
-import { fmtFixed, fmtInt, fmtTime, fmtUsd } from "@/lib/format";
+import type { LivePayload } from "@/lib/data";
+import { fmtInt, fmtFixed, fmtTime, fmtUsd } from "@/lib/format";
 import { FillsTable } from "./fills-table";
-import { bucketed, drawdownOf, equityCurve, outcomes, portfolioAt, upTo } from "./model";
+import { LiveStore, type LiveSnapshot } from "./live-store";
+import { equityCurve, maxDrawdownAt, portfolioAt } from "./model";
 import { PriceChart } from "./price-chart";
 import { ChartViewBar, useChartView } from "./controls/chart-view";
 import { LiveControls } from "./controls/live-controls";
 import { useLiveControls } from "./controls/use-live-controls";
 
 const POLL_MS = 3000;
+const NO_BREAKS: number[] = [];
+const close = (c: Candle) => ({ ts: c.ts, value: c.close });
 
 export default function Dashboard() {
   const theme = useChartTheme();
-  const [data, setData] = useState<BotData | null>(null);
+  const [store] = useState(() => new LiveStore());
+  const [data, setData] = useState<LiveSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
+    let busy = false;
     const load = async () => {
+      if (busy) return;
+      busy = true;
       try {
-        const res = await fetch("/api/data", { cache: "no-store" });
-        const json = await res.json();
+        const query = store.query();
+        const res = await fetch(`/api/data${query}`, { cache: "no-store" });
         if (cancelled) return;
-        if (!res.ok) throw new Error(json.error ?? res.statusText);
-        setData(json);
+        if (res.status !== 304) {
+          const json = await res.json();
+          if (cancelled) return;
+          if (!res.ok) throw new Error(json.error ?? res.statusText);
+          const snapshot = store.apply(json as LivePayload, query);
+          if (snapshot) setData(snapshot);
+        }
         setError(null);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        busy = false;
       }
     };
     load();
@@ -45,32 +60,15 @@ export default function Dashboard() {
       cancelled = true;
       clearInterval(id);
     };
-  }, []);
+  }, [store]);
 
-  const range = useMemo(() => {
-    if (!data) return null;
-    let min = Infinity;
-    let max = -Infinity;
-    for (const points of Object.values(data.features)) {
-      if (!points.length) continue;
-      min = Math.min(min, points[0].ts);
-      max = Math.max(max, points[points.length - 1].ts);
-    }
-    if (!Number.isFinite(min)) return null;
-    // A fill can land just after the last feature sample; keep it visible in live mode.
-    const lastFill = data.fills.at(-1);
-    if (lastFill && lastFill.ts > max) max = lastFill.ts;
-    return { min, max };
-  }, [data]);
-
+  const range = data?.range ?? null;
   const controls = useLiveControls(range);
   const { t, live, showBidAsk, showFills } = controls;
   const scoreView = useChartView("score", range);
   const equityView = useChartView("equity", range, Infinity);
 
-  const curve = useMemo(() => (data ? equityCurve(data) : []), [data]);
-  const sides = useMemo(() => (data ? outcomes(data, theme) : []), [data, theme]);
-  const breaks = useMemo(() => data?.markets.slice(1).map((m) => m.start) ?? [], [data]);
+  const curve = useMemo(() => (data ? equityCurve(data) : null), [data]);
   const marketStarts = useMemo(() => data?.markets.map((m) => m.start) ?? [], [data]);
   const separators = useMemo<Separator[]>(
     () => data?.markets.map((m) => ({ ts: m.start, label: fmtTime(m.start).slice(0, 5) })) ?? [],
@@ -102,7 +100,7 @@ export default function Dashboard() {
     </PageHeader>
   );
 
-  if (!data) {
+  if (!data || !curve) {
     return (
       <Page>
         {header}
@@ -123,16 +121,13 @@ export default function Dashboard() {
   }
 
   const portfolio = portfolioAt(data, t);
-  const visibleFills = data.fills.filter((f) => f.ts <= t);
   const threshold = data.config.signalThreshold;
-  const visibleCurve = upTo(curve, t);
-  const drawdown = drawdownOf(visibleCurve);
-  const maxDrawdown = drawdown.reduce((acc, p) => Math.min(acc, p.value), 0);
+  const maxDrawdown = maxDrawdownAt(curve, t);
   const currentMarketStart = data.markets.at(-1)?.start ?? range.min;
   const yesPosition = portfolio.positions[data.tokens.yes] ?? 0;
   const noPosition = portfolio.positions[data.tokens.no] ?? 0;
 
-  const yes = sides[0];
+  const yes = data.sides[0].points;
   const scoreSeries: ChartSeries[] = [
     {
       id: "score",
@@ -140,7 +135,7 @@ export default function Dashboard() {
       type: "line",
       color: theme.accent,
       lineWidth: 2,
-      data: bucketed(upTo(yes.points, t), (p) => p.score, scoreView.interval, breaks),
+      data: candleSeries(yes.ts, yes.score, scoreView.interval, data.breaks).pointsUpTo(t, "close", close),
       priceLines: [
         { price: threshold, color: theme.up, title: "compra YES" },
         { price: 0, color: theme.zeroLine },
@@ -155,7 +150,7 @@ export default function Dashboard() {
       type: "baseline",
       color: theme.violet,
       baseValue: data.config.startingCash,
-      data: bucketed(visibleCurve, (p) => p.equity, equityView.interval, []),
+      data: candleSeries(curve.ts, curve.equity, equityView.interval, NO_BREAKS).pointsUpTo(t, "close", close),
     },
     {
       id: "drawdown",
@@ -164,7 +159,7 @@ export default function Dashboard() {
       pane: 1,
       color: theme.down,
       lineWidth: 1,
-      data: bucketed(drawdown, (p) => p.value, equityView.interval, []),
+      data: candleSeries(curve.ts, curve.drawdown, equityView.interval, NO_BREAKS).pointsUpTo(t, "close", close),
     },
   ];
 
@@ -196,20 +191,21 @@ export default function Dashboard() {
           value={`${fmtFixed(yesPosition, 2)} / ${fmtFixed(noPosition, 2)}`}
           hint="YES / NO"
         />
-        <Kpi label="Fills" icon={ArrowLeftRight} value={fmtInt(visibleFills.length)} />
+        <Kpi label="Fills" icon={ArrowLeftRight} value={fmtInt(portfolio.fills)} />
       </KpiGrid>
 
       <ChartGroup edge={t}>
         <div className="grid gap-4 md:gap-6">
-          {sides.map((side) => (
+          {data.sides.map((side) => (
             <PriceChart
               key={side.label}
               side={side}
+              color={side.label === "YES" ? theme.up : theme.down}
               t={t}
               range={range}
               live={live}
-              fills={showFills ? visibleFills.filter((f) => side.tokens.has(f.token_id)) : []}
-              breaks={breaks}
+              showFills={showFills}
+              breaks={data.breaks}
               separators={separators}
               showBidAsk={showBidAsk}
               marketStart={currentMarketStart}
@@ -242,8 +238,8 @@ export default function Dashboard() {
         </section>
       </ChartGroup>
 
-      <Panel title="Fills" actions={<ToneBadge>{fmtInt(visibleFills.length)}</ToneBadge>}>
-        <FillsTable fills={visibleFills} tokens={data.tokens} />
+      <Panel title="Fills" actions={<ToneBadge>{fmtInt(portfolio.fills)}</ToneBadge>}>
+        <FillsTable fills={data.fills} count={portfolio.fills} tokens={data.tokens} />
       </Panel>
     </Page>
   );

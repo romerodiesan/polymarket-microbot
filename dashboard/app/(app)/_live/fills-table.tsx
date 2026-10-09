@@ -2,8 +2,9 @@
 
 import { type Column, DataTable } from "@/components/app/data-table";
 import { Signed, ToneBadge, TokenBadge } from "@/components/app/indicators";
-import type { BotData, Fill } from "@/lib/data";
-import { fmtFixed, fmtPrice, fmtTime, fmtUsd } from "@/lib/format";
+import type { BotMeta } from "@/lib/data";
+import { fmtFixed, fmtInt, fmtPrice, fmtTime, fmtUsd } from "@/lib/format";
+import type { Fill } from "./live-store";
 
 const REASONS: Record<string, string> = {
   entry: "Entrada",
@@ -15,7 +16,7 @@ const REASONS: Record<string, string> = {
   rollover: "Cambio de mercado",
 };
 
-function fillColumns(tokens: BotData["tokens"]): Column<Fill>[] {
+function fillColumns(tokens: BotMeta["tokens"]): Column<Fill>[] {
   const label = (id: string) => (id === tokens.yes ? "YES" : id === tokens.no ? "NO" : id.slice(0, 8));
   return [
     { key: "ts", header: "Hora", cell: (f) => <span className="font-mono tabular-nums">{fmtTime(f.ts)}</span> },
@@ -50,14 +51,25 @@ function fillColumns(tokens: BotData["tokens"]): Column<Fill>[] {
   ];
 }
 
-export function FillsTable({ fills, tokens }: { fills: Fill[]; tokens: BotData["tokens"] }) {
+const MAX_ROWS = 200;
+
+/** The latest of the first `count` fills (those visible at the playback time), newest first. */
+export function FillsTable({ fills, count, tokens }: { fills: Fill[]; count: number; tokens: BotMeta["tokens"] }) {
+  const rows = fills.slice(Math.max(0, count - MAX_ROWS), count).reverse();
   return (
-    <DataTable
-      columns={fillColumns(tokens)}
-      rows={fills.slice().reverse()}
-      rowKey={(f, i) => `${f.order_id}-${f.ts}-${i}`}
-      maxHeight={380}
-      empty="El bot aún no ha ejecutado operaciones."
-    />
+    <>
+      <DataTable
+        columns={fillColumns(tokens)}
+        rows={rows}
+        rowKey={(f) => `${f.order_id}-${f.ts}-${f.side}`}
+        maxHeight={380}
+        empty="El bot aún no ha ejecutado operaciones."
+      />
+      {count > MAX_ROWS && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Últimos {fmtInt(MAX_ROWS)} de {fmtInt(count)} fills.
+        </p>
+      )}
+    </>
   );
 }

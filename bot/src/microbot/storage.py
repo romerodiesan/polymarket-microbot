@@ -48,7 +48,11 @@ class Storage:
             final = self.parquet_dir / f"{table}.parquet"
             tmp = self.parquet_dir / f".{table}.parquet.tmp"
             target = tmp.as_posix().replace("'", "''")
-            self.db.execute(f"COPY {table} TO '{target}' (FORMAT PARQUET, OVERWRITE_OR_IGNORE true)")
+            # Small row groups let the dashboard decode just the newly appended tail.
+            self.db.execute(
+                f"COPY {table} TO '{target}' "
+                "(FORMAT PARQUET, ROW_GROUP_SIZE 16384, OVERWRITE_OR_IGNORE true)"
+            )
             # Atomic swap so readers (the dashboard) never see a half-written file.
             os.replace(tmp, final)
 

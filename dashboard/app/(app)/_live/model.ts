@@ -1,102 +1,148 @@
-import { toCandles } from "@/components/charts/candles";
-import type { TimePoint } from "@/components/charts/time-series";
-import type { BotData, FeaturePoint } from "@/lib/data";
+import type { ChartMarker } from "@/components/charts/time-series";
+import { lastIndexAtOrBefore } from "@/components/charts/candles";
+import { fmtFixed } from "@/lib/format";
+import { type Fill, type LiveSnapshot, fillsAt, midAt } from "./live-store";
 
-export function lastIndexAtOrBefore(points: { ts: number }[], t: number): number {
-  let lo = 0;
-  let hi = points.length - 1;
-  let found = -1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (points[mid].ts <= t) {
-      found = mid;
-      lo = mid + 1;
-    } else hi = mid - 1;
-  }
-  return found;
-}
-
-export function upTo<T extends { ts: number }>(points: T[], t: number): T[] {
-  const end = lastIndexAtOrBefore(points, t);
-  return end === points.length - 1 ? points : points.slice(0, end + 1);
-}
-
-export function portfolioAt(data: BotData, t: number) {
-  let cash = data.config.startingCash;
+/** Cash, positions and marked equity at `t`, from the fill ledger: O(log F) per token with fills. */
+export function portfolioAt(data: LiveSnapshot, t: number) {
+  const k = fillsAt(data.fills, t);
+  const cash = k ? data.ledger.cashAfter[k - 1] : data.config.startingCash;
   const positions: Record<string, number> = {};
-  for (const f of data.fills) {
-    if (f.ts > t) break;
-    const signed = f.side === "BUY" ? f.size : -f.size;
-    cash -= signed * f.price + f.fee;
-    positions[f.token_id] = (positions[f.token_id] ?? 0) + signed;
-  }
   let equity = cash;
-  for (const [token, pos] of Object.entries(positions)) {
-    const points = data.features[token] ?? [];
-    const i = lastIndexAtOrBefore(points, t);
-    if (i >= 0) equity += pos * points[i].mid;
+  for (const [token, book] of data.ledger.tokens) {
+    const j = lastIndexAtOrBefore(book.at, k - 1);
+    if (j < 0) continue;
+    const position = book.position[j];
+    positions[token] = position;
+    if (!position) continue;
+    const mid = midAt(data, token, t);
+    if (mid !== undefined && Number.isFinite(mid)) equity += position * mid;
   }
-  return { cash, positions, equity, pnl: equity - data.config.startingCash };
+  return { cash, positions, equity, pnl: equity - data.config.startingCash, fills: k };
 }
 
-export function equityCurve(data: BotData) {
-  const tokens = Object.keys(data.features);
-  const timeline = tokens
-    .flatMap((token) => data.features[token].map((p) => ({ ts: p.ts, token, mid: p.mid })))
-    .sort((a, b) => a.ts - b.ts);
-  const lastMid: Record<string, number> = {};
-  const positions: Record<string, number> = {};
-  let cash = data.config.startingCash;
-  let fillIdx = 0;
-  const out: { ts: number; equity: number }[] = [];
-  const step = Math.max(1, Math.floor(timeline.length / 3000));
-  timeline.forEach((p, i) => {
-    lastMid[p.token] = p.mid;
-    while (fillIdx < data.fills.length && data.fills[fillIdx].ts <= p.ts) {
-      const f = data.fills[fillIdx++];
+/** Equity sampled over the whole range, with its drawdown and the worst drawdown so far. */
+export type EquityCurve = { ts: number[]; equity: number[]; drawdown: number[]; worst: number[] };
+
+const MAX_SAMPLES = 15000;
+/** Grid steps, coarsest last; the step only changes when the range outgrows one. */
+const STEPS = [2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
+/** Samples this close to the end are recomputed on the next update (late rows can still move them). */
+const SETTLE_SECONDS = 60;
+
+type CurveState = {
+  cash: number;
+  open: Map<string, number>;
+  next: number;
+  peak: number;
+  worst: number;
+  g: number;
+  length: number;
+  lastFill: Fill | undefined;
+};
+
+type CurveCache = { min: number; step: number; startingCash: number; checkpoint: CurveState; curve: EquityCurve };
+
+/** Keyed by the store's token map, which lives until a full reload. */
+const curveCache = new WeakMap<LiveSnapshot["features"], CurveCache>();
+
+/**
+ * Equity on a regular grid plus every fill time: positions change only at fills, so each sample
+ * marks the few open positions at their mid (binary search), with no sorting. Successive snapshots
+ * resume from a checkpoint SETTLE_SECONDS before the previous end, so an update costs O(new samples).
+ */
+export function equityCurve(data: LiveSnapshot): EquityCurve {
+  if (!data.range) return { ts: [], equity: [], drawdown: [], worst: [] };
+  const { min, max } = data.range;
+  const step = STEPS.find((s) => (max - min) / s <= MAX_SAMPLES) ?? STEPS[STEPS.length - 1];
+  const startingCash = data.config.startingCash;
+  const { fills } = data;
+
+  const cached = curveCache.get(data.features);
+  const resume =
+    cached &&
+    cached.min === min &&
+    cached.step === step &&
+    cached.startingCash === startingCash &&
+    cached.checkpoint.next <= fills.length &&
+    fills[cached.checkpoint.next - 1] === cached.checkpoint.lastFill;
+  const from: CurveState = resume
+    ? cached.checkpoint
+    : { cash: startingCash, open: new Map(), next: 0, peak: -Infinity, worst: 0, g: min, length: 0, lastFill: undefined };
+  const out: EquityCurve = resume
+    ? {
+        ts: cached.curve.ts.slice(0, from.length),
+        equity: cached.curve.equity.slice(0, from.length),
+        drawdown: cached.curve.drawdown.slice(0, from.length),
+        worst: cached.curve.worst.slice(0, from.length),
+      }
+    : { ts: [], equity: [], drawdown: [], worst: [] };
+
+  let { cash, next, peak, worst, g } = from;
+  const open = new Map(from.open);
+  let checkpoint: CurveState | null = null;
+
+  const sample = (t: number) => {
+    if (out.ts.length && t <= out.ts[out.ts.length - 1]) return;
+    while (next < fills.length && fills[next].ts <= t) {
+      const f = fills[next++];
       const signed = f.side === "BUY" ? f.size : -f.size;
       cash -= signed * f.price + f.fee;
-      positions[f.token_id] = (positions[f.token_id] ?? 0) + signed;
+      const position = (open.get(f.token_id) ?? 0) + signed;
+      if (Math.abs(position) < 1e-12) open.delete(f.token_id);
+      else open.set(f.token_id, position);
     }
-    if (i % step === 0 || i === timeline.length - 1) {
-      let equity = cash;
-      for (const [token, pos] of Object.entries(positions)) equity += pos * (lastMid[token] ?? 0);
-      out.push({ ts: p.ts, equity });
+    let equity = cash;
+    for (const [token, position] of open) {
+      const mid = midAt(data, token, t);
+      if (mid !== undefined && Number.isFinite(mid)) equity += position * mid;
     }
-  });
+    peak = Math.max(peak, equity);
+    worst = Math.min(worst, equity - peak);
+    out.ts.push(t);
+    out.equity.push(equity);
+    out.drawdown.push(equity - peak);
+    out.worst.push(worst);
+  };
+
+  const settled = max - SETTLE_SECONDS;
+  while (g < max) {
+    const fillTs = next < fills.length ? fills[next].ts : Infinity;
+    const t = Math.min(fillTs, g);
+    if (!checkpoint && t > settled) {
+      checkpoint = { cash, open: new Map(open), next, peak, worst, g, length: out.ts.length, lastFill: fills[next - 1] };
+    }
+    if (fillTs < g) sample(fillTs);
+    else {
+      sample(g);
+      g += step;
+    }
+  }
+  checkpoint ??= { cash, open: new Map(open), next, peak, worst, g, length: out.ts.length, lastFill: fills[next - 1] };
+  sample(max);
+  curveCache.set(data.features, { min, step, startingCash, checkpoint, curve: out });
   return out;
 }
 
-/** Distance below the running equity peak (≤ 0). */
-export function drawdownOf(curve: { ts: number; equity: number }[]) {
-  let peak = -Infinity;
-  return curve.map((p) => {
-    peak = Math.max(peak, p.equity);
-    return { ts: p.ts, value: p.equity - peak };
-  });
+/** Worst drawdown up to `t` (≤ 0). */
+export function maxDrawdownAt(curve: EquityCurve, t: number) {
+  const i = lastIndexAtOrBefore(curve.ts, t);
+  return i >= 0 ? curve.worst[i] : 0;
 }
 
-export type Outcome = { label: "YES" | "NO"; color: string; tokens: Set<string>; points: FeaturePoint[] };
+const markerCache = new WeakMap<Fill[], ChartMarker[]>();
 
-/** YES and NO as continuous series: across every market of a rolling series, or the fixed tokens. */
-export function outcomes(data: BotData, colors: { up: string; down: string }): Outcome[] {
-  const build = (side: "yes" | "no", label: Outcome["label"], color: string): Outcome => {
-    const ids = data.markets.length ? data.markets.map((m) => m[side]).filter(Boolean) : [data.tokens[side]];
-    const points = ids.flatMap((id) => data.features[id] ?? []).sort((a, b) => a.ts - b.ts);
-    return { label, color, tokens: new Set(ids), points };
-  };
-  return [build("yes", "YES", colors.up), build("no", "NO", colors.down)];
-}
-
-/** Last value per candle bucket, so every chart in the group shares the same time slots. */
-export function bucketed<T extends { ts: number }>(
-  points: T[],
-  value: (p: T) => number,
-  interval: number,
-  breaks: number[],
-): TimePoint[] {
-  return toCandles(points.map((p) => ({ ts: p.ts, value: value(p) })), interval, breaks).map((c) => ({
-    ts: c.ts,
-    value: c.close,
-  }));
+/** Chart markers for `fills`, built once per fills array; slice to the visible count. */
+export function fillMarkers(fills: Fill[]): ChartMarker[] {
+  let markers = markerCache.get(fills);
+  if (!markers) {
+    markers = fills.map((f) => ({
+      ts: f.ts,
+      price: f.price,
+      kind: f.side === "BUY" ? "buy" : "sell",
+      text: `${f.side === "BUY" ? "C" : "V"} ${fmtFixed(f.size, 1)}`,
+    }));
+    markerCache.set(fills, markers);
+  }
+  return markers;
 }

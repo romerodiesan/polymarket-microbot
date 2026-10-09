@@ -123,12 +123,73 @@ function toMarkers(markers: ChartMarker[], times: UTCTimestamp[], T: ChartTheme)
     .sort((a, b) => (a.time as number) - (b.time as number));
 }
 
+type BarData = ReturnType<typeof toLineData>[number] | ReturnType<typeof toCandleData>[number];
+
+/** What a series last received, to send only the tail when the next data extends it. */
+type Sent = {
+  length: number;
+  first: unknown;
+  /** Element before the last; the last one may still be changing (live candle). */
+  penultimate: unknown;
+  times: UTCTimestamp[];
+  markers: ChartMarker[];
+};
+
 type Entry = {
   key: string;
   api: ISeriesApi<SeriesType>;
   markers: ISeriesMarkersPluginApi<Time> | null;
   priceLines: IPriceLine[];
+  priceLinesKey: string;
+  sent: Sent | null;
 };
+
+const toBars = (s: ChartSeries, data: ChartSeries["data"]): BarData[] =>
+  s.type === "candles" ? toCandleData(data as Candle[]) : toLineData(data as TimePoint[]);
+
+/**
+ * Sends `s.data` to the chart. When it starts with the same objects as last time (the producers
+ * reuse finished points), only the elements from the previous last one on go through `update()`:
+ * O(new points) instead of re-sending the whole series.
+ */
+function pushData(entry: Entry, s: ChartSeries): { times: UTCTimestamp[]; replaced: boolean } {
+  const data = s.data;
+  const prev = entry.sent;
+  let times: UTCTimestamp[] | null = null;
+  if (
+    prev !== null &&
+    prev.length > 0 &&
+    data.length >= prev.length &&
+    data[0] === prev.first &&
+    (prev.length < 2 || data[prev.length - 2] === prev.penultimate)
+  ) {
+    times = prev.times;
+    try {
+      for (const bar of toBars(s, data.slice(prev.length - 1))) {
+        const last = times[times.length - 1];
+        if (last !== undefined && bar.time < last) continue;
+        entry.api.update(bar);
+        if (bar.time !== last) times.push(bar.time);
+      }
+    } catch {
+      times = null;
+    }
+  }
+  const replaced = times === null;
+  if (times === null) {
+    const bars = toBars(s, data);
+    entry.api.setData(bars);
+    times = bars.map((b) => b.time);
+  }
+  entry.sent = {
+    length: data.length,
+    first: data[0],
+    penultimate: data[data.length - 2],
+    times,
+    markers: prev?.markers ?? [],
+  };
+  return { times, replaced };
+}
 
 type Ohlc = { open: number; high: number; low: number; close: number };
 type Legend = { time: Time | null; values: Record<string, number | Ohlc | undefined> };
@@ -241,6 +302,7 @@ export function TimeSeries({
   const entriesRef = useRef(new Map<string, Entry>());
   const separatorsRef = useRef<{ primitive: SeparatorsPrimitive; host: ISeriesApi<SeriesType> } | null>(null);
   const fittedKeyRef = useRef<string | number | undefined>(undefined);
+  const markerThemeRef = useRef<ChartTheme | null>(null);
   const [legend, setLegend] = useState<Legend>({ time: null, values: {} });
 
   useEffect(() => {
@@ -342,6 +404,8 @@ export function TimeSeries({
     if (!chart) return;
     const entries = entriesRef.current;
     const previousRange = chart.timeScale().getVisibleRange();
+    const themeChanged = markerThemeRef.current !== T;
+    markerThemeRef.current = T;
 
     for (const [id, entry] of entries) {
       const next = series.find((s) => s.id === id);
@@ -369,32 +433,51 @@ export function TimeSeries({
       const options = { ...common, ...colorOptions(s, T) };
       let entry = entries.get(s.id);
       if (!entry) {
-        entry = { key: shapeKey(s), api: addSeries(chart, s, options), markers: null, priceLines: [] };
+        entry = {
+          key: shapeKey(s),
+          api: addSeries(chart, s, options),
+          markers: null,
+          priceLines: [],
+          priceLinesKey: "",
+          sent: null,
+        };
         entries.set(s.id, entry);
       } else {
         entry.api.applyOptions(options);
       }
 
-      const data = s.type === "candles" ? toCandleData(s.data) : toLineData(s.data);
-      hasData ||= data.length > 0;
-      entry.api.setData(data);
+      const previousTimes = entry.sent?.times.length ?? -1;
+      const previousMarkers = entry.sent?.markers;
+      const { times, replaced } = pushData(entry, s);
+      hasData ||= times.length > 0;
 
-      for (const line of entry.priceLines) entry.api.removePriceLine(line);
-      const api = entry.api;
-      entry.priceLines = (s.priceLines ?? []).map((line) =>
-        api.createPriceLine({
-          price: line.price,
-          color: line.color,
-          lineWidth: 1,
-          lineStyle: LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: line.title ?? "",
-        }),
-      );
+      const priceLinesKey = JSON.stringify(s.priceLines ?? []);
+      if (priceLinesKey !== entry.priceLinesKey) {
+        for (const line of entry.priceLines) entry.api.removePriceLine(line);
+        const api = entry.api;
+        entry.priceLines = (s.priceLines ?? []).map((line) =>
+          api.createPriceLine({
+            price: line.price,
+            color: line.color,
+            lineWidth: 1,
+            lineStyle: LineStyle.Dashed,
+            axisLabelVisible: true,
+            title: line.title ?? "",
+          }),
+        );
+        entry.priceLinesKey = priceLinesKey;
+      }
 
-      const markers = toMarkers(s.markers ?? [], data.map((d) => d.time), T);
-      if (entry.markers) entry.markers.setMarkers(markers);
-      else if (markers.length) entry.markers = createSeriesMarkers(entry.api, markers);
+      // Markers snap to bar times, so they only move when the markers or the bars change.
+      const markerList = s.markers ?? [];
+      const markersChanged =
+        markerList.length !== previousMarkers?.length || markerList.at(-1) !== previousMarkers.at(-1);
+      if (markersChanged || replaced || times.length !== previousTimes || themeChanged) {
+        const markers = toMarkers(markerList, times, T);
+        if (entry.markers) entry.markers.setMarkers(markers);
+        else if (markers.length) entry.markers = createSeriesMarkers(entry.api, markers);
+      }
+      entry.sent!.markers = markerList;
     }
 
     const panes = chart.panes();
