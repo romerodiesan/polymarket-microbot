@@ -143,6 +143,42 @@ Para consultar el bot de un VPS sin abrir puertos, lanza el servidor por SSH (st
 }
 ```
 
+### MCP remoto (ChatGPT)
+
+`microbot-mcp --http` sirve el mismo MCP por Streamable HTTP en `127.0.0.1:8765` con un servidor OAuth
+propio de un solo usuario: ChatGPT se registra solo (registro dinámico), abre una página de login y tú
+escribes la contraseña. Los tokens duran 1 h (refresh de 30 días, rotado en cada uso) y se guardan solo
+como SHA-256 en `data/mcp/oauth.json`. El login se bloquea 15 min tras 5 fallos por IP. En el VPS, desde
+`/srv/bot/bot` (los archivos están en [`deploy/`](deploy/)):
+
+1. DNS: registro `A` de `mcp.midominio.com` a la IP del VPS.
+2. Configuración:
+
+   ```bash
+   cp ../deploy/env.mcp.example .env.mcp && chmod 600 .env.mcp
+   openssl rand -base64 24   # pégala en MICROBOT_MCP_PASSWORD
+   mkdir -p data/mcp
+   ```
+
+3. Servicio (ajusta `User`/`Group` a la cuenta que ejecuta el bot):
+
+   ```bash
+   sudo cp ../deploy/microbot-mcp.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now microbot-mcp
+   journalctl -u microbot-mcp -f
+   ```
+
+4. Caddy: añade el bloque de `deploy/Caddyfile.mcp` junto al de `bot.midominio.com` y
+   `sudo systemctl reload caddy`. Caddy obtiene el certificado solo.
+5. Prueba: `curl https://mcp.midominio.com/healthz` devuelve `ok`, y
+   `curl -i -X POST https://mcp.midominio.com/mcp` devuelve `401`.
+6. ChatGPT: activa el modo desarrollador en los ajustes de conectores/apps, crea un conector con la URL
+   `https://mcp.midominio.com/mcp` y autenticación OAuth. Se abre el login; al autorizar vuelve a ChatGPT
+   con las herramientas.
+
+Para cortar el acceso, borra `data/mcp/oauth.json` (y cambia la contraseña si se filtró) y
+`sudo systemctl restart microbot-mcp`.
+
 ## Modos
 
 - `record`: captura y calcula features sin operar.
@@ -237,6 +273,8 @@ bot/src/microbot/storage.py    DuckDB y exportación Parquet
 bot/src/microbot/ws.py         WebSocket y reconexión
 bot/src/microbot/main.py       orquestación
 bot/src/microbot/train.py      entrenamiento del modelo base
-bot/src/microbot/mcp_server.py servidor MCP de analítica (solo lectura)
+bot/src/microbot/mcp_server.py servidor MCP de analítica (solo lectura; stdio o HTTP)
+bot/src/microbot/mcp_auth.py   OAuth de un usuario para el MCP remoto
+deploy/                        Caddy y systemd para mcp.midominio.com
 dashboard/                     app Next.js (en vivo, datos, entrenamiento, control del bot)
 ```

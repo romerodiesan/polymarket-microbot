@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from time import time
 from typing import Any
+from urllib.parse import urlparse
 
 import duckdb
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+
+from .mcp_auth import SCOPE, SingleUserOAuthProvider, install_login
 
 
 def _resolve_data_dir() -> Path:
@@ -41,14 +51,12 @@ READ_ONLY = ToolAnnotations(
     openWorldHint=False,
 )
 
-mcp = FastMCP(
-    "polymarket-microbot-analytics",
-    instructions=(
-        "Read-only access to Polymarket microbot snapshots and training results. "
-        "Check data quality, spread, fees, P&L and temporal comparability before "
-        "recommending algorithm changes. Never claim that a model is profitable "
-        "based only on classification metrics."
-    ),
+NAME = "polymarket-microbot-analytics"
+INSTRUCTIONS = (
+    "Read-only access to Polymarket microbot snapshots and training results. "
+    "Check data quality, spread, fees, P&L and temporal comparability before "
+    "recommending algorithm changes. Never claim that a model is profitable "
+    "based only on classification metrics."
 )
 
 
@@ -168,7 +176,6 @@ def find_run(run_id: str) -> dict[str, Any] | None:
     return next((run for run in load_runs() if run["run_id"] == run_id), None)
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def get_capture_status() -> dict[str, Any]:
     """Get capture health, freshness, row counts and snapshot information."""
     state = read_json(STATE_FILE, {}) or {}
@@ -208,7 +215,6 @@ def get_capture_status() -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def get_market_summary(lookback_hours: float = 24, token_id: str | None = None) -> dict[str, Any]:
     """Summarize spread, depth and microstructure signals."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 31)
@@ -248,7 +254,6 @@ def get_market_summary(lookback_hours: float = 24, token_id: str | None = None) 
     return {"lookback_hours": lookback_hours, "tokens": rows}
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def get_recent_features(token_id: str | None = None, limit: int = 100) -> dict[str, Any]:
     """Return recent microstructure observations."""
     limit = max(1, min(int(limit), MAX_ROWS))
@@ -271,7 +276,6 @@ def get_recent_features(token_id: str | None = None, limit: int = 100) -> dict[s
     return {"count": len(rows), "limit": limit, "rows": rows}
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def get_data_quality(lookback_hours: float = 24) -> dict[str, Any]:
     """Measure sampling intervals, gaps and duplicate timestamps."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 31)
@@ -302,7 +306,6 @@ def get_data_quality(lookback_hours: float = 24) -> dict[str, Any]:
     return {"lookback_hours": lookback_hours, "tokens": rows}
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def get_paper_performance(lookback_hours: float = 168) -> dict[str, Any]:
     """Calculate paper fills, positions, fees, realized and marked P&L."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 365)
@@ -379,7 +382,6 @@ def get_paper_performance(lookback_hours: float = 168) -> dict[str, Any]:
     }
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def list_training_runs(limit: int = 20) -> dict[str, Any]:
     """List registered model-training results, newest first."""
     limit = max(1, min(int(limit), 100))
@@ -387,14 +389,12 @@ def list_training_runs(limit: int = 20) -> dict[str, Any]:
     return {"count": len(runs), "runs": runs}
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def get_training_run(run_id: str) -> dict[str, Any]:
     """Get complete results for one training run."""
     run = find_run(run_id)
     return run if run else {"error": f"Training run not found: {run_id}"}
 
 
-@mcp.tool(annotations=READ_ONLY, structured_output=True)
 def compare_training_runs(run_ids: list[str]) -> dict[str, Any]:
     """Compare explicitly selected training runs."""
     if not 2 <= len(run_ids) <= 10:
@@ -418,8 +418,104 @@ def compare_training_runs(run_ids: list[str]) -> dict[str, Any]:
     }
 
 
+TOOLS = (
+    get_capture_status,
+    get_market_summary,
+    get_recent_features,
+    get_data_quality,
+    get_paper_performance,
+    list_training_runs,
+    get_training_run,
+    compare_training_runs,
+)
+
+MIN_PASSWORD_LENGTH = 16
+
+
+@dataclass(frozen=True)
+class HttpConfig:
+    public_url: str
+    password: str
+    host: str = "127.0.0.1"
+    port: int = 8765
+
+    @classmethod
+    def from_env(cls, environ: Mapping[str, str] = os.environ) -> HttpConfig:
+        public_url = environ.get("MICROBOT_MCP_PUBLIC_URL", "").strip().rstrip("/")
+        parsed = urlparse(public_url)
+        if parsed.scheme != "https" or not parsed.netloc or parsed.path:
+            raise ValueError(
+                "MICROBOT_MCP_PUBLIC_URL must be the public https origin, e.g. https://mcp.example.com"
+            )
+        password = environ.get("MICROBOT_MCP_PASSWORD", "")
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise ValueError(
+                f"MICROBOT_MCP_PASSWORD must have at least {MIN_PASSWORD_LENGTH} characters"
+            )
+        return cls(
+            public_url=public_url,
+            password=password,
+            host=environ.get("MICROBOT_MCP_HOST", "127.0.0.1"),
+            port=int(environ.get("MICROBOT_MCP_PORT", "8765")),
+        )
+
+
+def create_server(http: HttpConfig | None = None, state_file: Path | None = None) -> FastMCP:
+    """stdio when `http` is None; otherwise Streamable HTTP behind the built-in OAuth server."""
+    if http is None:
+        server = FastMCP(NAME, instructions=INSTRUCTIONS)
+    else:
+        provider = SingleUserOAuthProvider(
+            http.public_url, http.password, state_file or DATA_DIR / "mcp" / "oauth.json"
+        )
+        server = FastMCP(
+            NAME,
+            instructions=INSTRUCTIONS,
+            host=http.host,
+            port=http.port,
+            auth_server_provider=provider,
+            auth=AuthSettings(
+                issuer_url=http.public_url,
+                resource_server_url=f"{http.public_url}/mcp",
+                client_registration_options=ClientRegistrationOptions(
+                    enabled=True, valid_scopes=[SCOPE], default_scopes=[SCOPE]
+                ),
+                revocation_options=RevocationOptions(enabled=True),
+                required_scopes=[SCOPE],
+                validate_token_resource=False,
+            ),
+            transport_security=TransportSecuritySettings(
+                allowed_hosts=[urlparse(http.public_url).netloc, "127.0.0.1:*", "localhost:*"],
+                allowed_origins=[http.public_url, "https://chatgpt.com", "https://chat.openai.com"],
+            ),
+        )
+        install_login(server, provider)
+
+        @server.custom_route("/healthz", methods=["GET"])
+        async def healthz(_: Request) -> Response:
+            return PlainTextResponse("ok")
+
+    for tool in TOOLS:
+        server.add_tool(tool, annotations=READ_ONLY, structured_output=True)
+    return server
+
+
 def main() -> None:
-    mcp.run(transport="stdio")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve Streamable HTTP with OAuth (MICROBOT_MCP_PUBLIC_URL, MICROBOT_MCP_PASSWORD).",
+    )
+    args = parser.parse_args()
+    if not args.http:
+        create_server().run(transport="stdio")
+        return
+    try:
+        config = HttpConfig.from_env()
+    except ValueError as exc:
+        parser.exit(2, f"microbot-mcp: {exc}\n")
+    create_server(config).run(transport="streamable-http")
 
 
 if __name__ == "__main__":
