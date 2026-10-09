@@ -117,12 +117,7 @@ predicciones de alta confianza; eso todavía no equivale a rentabilidad.
 `microbot-mcp` expone los datos del bot a un agente (Cursor, Claude, etc.) por stdio, **solo en lectura**:
 consulta los Parquet exportados con DuckDB en memoria (sin bloquear `microbot.duckdb`), el estado del
 proceso en `data/bot/state.json` y las ejecuciones de `data/training/`. Del `.env` solo expone `PM_MODE` y
-`PM_SERIES_SLUG`.
-
-```bash
-cd bot
-pip install -e '.[mcp]'
-```
+`PM_SERIES_SLUG`. Se instala con el bot (`pip install -e .`).
 
 | Herramienta | Devuelve |
 | --- | --- |

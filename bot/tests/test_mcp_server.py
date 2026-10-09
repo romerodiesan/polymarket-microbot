@@ -6,8 +6,6 @@ import time
 import duckdb
 import pytest
 
-pytest.importorskip("mcp")
-
 TOKEN = "tok-up"
 
 
