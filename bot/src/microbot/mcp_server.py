@@ -15,12 +15,17 @@ from typing import Any
 from urllib.parse import urlparse
 
 import duckdb
+import uvicorn
+from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
+from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 
 from .mcp_auth import SCOPE, SingleUserOAuthProvider, install_login
 
@@ -500,6 +505,37 @@ def create_server(http: HttpConfig | None = None, state_file: Path | None = None
     return server
 
 
+def http_app(server: FastMCP) -> Starlette:
+    """The Streamable HTTP app, advertising public PKCE clients (ChatGPT registers with `none`).
+
+    The SDK accepts `token_endpoint_auth_method: none` at /register and /token but leaves it out of
+    its metadata, so clients that require it never register; this route takes precedence.
+    """
+    app = server.streamable_http_app()
+    auth = server.settings.auth
+    if auth and auth.client_registration_options and auth.revocation_options:
+        metadata = build_metadata(
+            auth.issuer_url,
+            auth.service_documentation_url,
+            auth.client_registration_options,
+            auth.revocation_options,
+        )
+        metadata.token_endpoint_auth_methods_supported = [
+            "none",
+            "client_secret_post",
+            "client_secret_basic",
+        ]
+        app.router.routes.insert(
+            0,
+            Route(
+                "/.well-known/oauth-authorization-server",
+                endpoint=cors_middleware(MetadataHandler(metadata).handle, ["GET", "OPTIONS"]),
+                methods=["GET", "OPTIONS"],
+            ),
+        )
+    return app
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -515,7 +551,7 @@ def main() -> None:
         config = HttpConfig.from_env()
     except ValueError as exc:
         parser.exit(2, f"microbot-mcp: {exc}\n")
-    create_server(config).run(transport="streamable-http")
+    uvicorn.run(http_app(create_server(config)), host=config.host, port=config.port)
 
 
 if __name__ == "__main__":

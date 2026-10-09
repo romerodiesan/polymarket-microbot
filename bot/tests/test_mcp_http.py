@@ -10,7 +10,7 @@ from starlette.testclient import TestClient
 
 from microbot import mcp_auth
 from microbot.mcp_auth import SingleUserOAuthProvider
-from microbot.mcp_server import HttpConfig, create_server
+from microbot.mcp_server import HttpConfig, create_server, http_app
 
 PUBLIC = "https://mcp.example.com"
 PASSWORD = "correct-horse-battery-staple"
@@ -25,18 +25,18 @@ def state_file(tmp_path):
 @pytest.fixture
 def client(state_file, monkeypatch):
     monkeypatch.setattr(mcp_auth, "FAILURE_DELAY", 0)
-    app = create_server(HttpConfig(PUBLIC, PASSWORD), state_file).streamable_http_app()
+    app = http_app(create_server(HttpConfig(PUBLIC, PASSWORD), state_file))
     with TestClient(app, base_url=PUBLIC, follow_redirects=False) as test_client:
         yield test_client
 
 
-def register(client):
+def register(client, auth_method="client_secret_post"):
     response = client.post(
         "/register",
         json={
             "redirect_uris": [REDIRECT],
             "client_name": "ChatGPT",
-            "token_endpoint_auth_method": "client_secret_post",
+            "token_endpoint_auth_method": auth_method,
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
         },
@@ -88,13 +88,17 @@ def exchange(client, app_client, code, verifier):
             "redirect_uri": REDIRECT,
             "code_verifier": verifier,
             "client_id": app_client["client_id"],
-            "client_secret": app_client["client_secret"],
+            **(
+                {"client_secret": app_client["client_secret"]}
+                if "client_secret" in app_client
+                else {}
+            ),
         },
     )
 
 
-def tokens(client):
-    app_client = register(client)
+def tokens(client, auth_method="client_secret_post"):
+    app_client = register(client, auth_method)
     verifier = secrets.token_urlsafe(48)
     response = exchange(client, app_client, authorize(client, app_client, verifier), verifier)
     assert response.status_code == 200, response.text
@@ -134,12 +138,14 @@ def test_unauthenticated_requests_get_discovery_metadata(client):
     assert server["authorization_endpoint"] == f"{PUBLIC}/authorize"
     assert server["registration_endpoint"] == f"{PUBLIC}/register"
     assert "S256" in server["code_challenge_methods_supported"]
+    assert "none" in server["token_endpoint_auth_methods_supported"]
 
     assert client.get("/healthz").text == "ok"
 
 
-def test_full_flow_reaches_the_tools(client):
-    _, issued = tokens(client)
+@pytest.mark.parametrize("auth_method", ["none", "client_secret_post"])
+def test_full_flow_reaches_the_tools(client, auth_method):
+    _, issued = tokens(client, auth_method)
     response, result = rpc(
         client,
         issued["access_token"],
