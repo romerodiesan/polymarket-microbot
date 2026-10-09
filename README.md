@@ -73,7 +73,7 @@ virtualenv `bot/.bot` (o `bot/.venv`). Tiene tres secciones:
   features, preparación para entrenar y últimas filas).
 - **Entrenamiento** (`/training`): lanza y detiene `microbot-train`, con historial, métricas,
   coeficientes y log. Cada ejecución se guarda en `bot/data/training/<id>/` (modelo, métricas y log) y
-  entrena desde el Parquet exportado, así que funciona con el bot en marcha. Requiere `pip install -e '.[ml]'`.
+  entrena desde el Parquet exportado, así que funciona con el bot en marcha.
 
 ```bash
 cd dashboard
@@ -95,7 +95,6 @@ SELECT * FROM fills ORDER BY ts DESC LIMIT 20;
 Después de recopilar suficientes datos (preferiblemente varias sesiones y regímenes), desde `bot/`:
 
 ```bash
-pip install -e '.[ml]'
 microbot-train --db data/microbot.duckdb --output data/model.joblib --horizon-seconds 15
 ```
 

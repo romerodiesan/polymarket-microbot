@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import joblib
+
 from .features import FeatureRow
 
 FEATURE_COLUMNS = [
@@ -10,10 +12,6 @@ FEATURE_COLUMNS = [
 
 class ModelPredictor:
     def __init__(self, path: Path) -> None:
-        try:
-            import joblib
-        except ImportError as exc:
-            raise RuntimeError("Install ML dependencies: pip install -e '.[ml]'") from exc
         payload = joblib.load(path)
         self.model = payload["model"]
         self.columns = payload.get("columns", FEATURE_COLUMNS)

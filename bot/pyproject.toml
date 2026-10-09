@@ -5,18 +5,19 @@ description = "Order-book microstructure research and paper-trading bot for Poly
 requires-python = ">=3.11"
 dependencies = [
   "duckdb>=1.1,<2",
+  "joblib>=1.4,<2",
   "mcp>=1.20,<2",
   "numpy>=1.26,<3",
   "pandas>=2.2,<3",
   "pydantic>=2.8,<3",
   "pydantic-settings>=2.4,<3",
   "python-dotenv>=1.0,<2",
+  "scikit-learn>=1.5,<2",
   "websockets>=13,<16",
 ]
 
 [project.optional-dependencies]
 live = ["py-clob-client>=0.34,<1"]
-ml = ["lightgbm>=4.5,<5", "scikit-learn>=1.5,<2", "joblib>=1.4,<2"]
 dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "ruff>=0.7,<1"]
 [project.scripts]
 microbot = "microbot.main:main"
