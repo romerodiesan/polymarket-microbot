@@ -4,9 +4,11 @@ import path from "node:path";
 /** The bot's directory (its .env, data/ and virtualenv); the sibling bot/ folder unless MICROBOT_ROOT says otherwise. */
 export const ROOT = path.resolve(/*turbopackIgnore: true*/ process.cwd(), process.env.MICROBOT_ROOT ?? "../bot");
 
+export const ENV_FILE = path.join(/*turbopackIgnore: true*/ ROOT, ".env");
+
 /** The bot's .env; read on every call so edits apply without a restart. */
 export function readEnvFile(): Record<string, string> {
-  const file = path.join(/*turbopackIgnore: true*/ ROOT, ".env");
+  const file = ENV_FILE;
   if (!existsSync(file)) return {};
   const env: Record<string, string> = {};
   for (const line of readFileSync(file, "utf8").split("\n")) {

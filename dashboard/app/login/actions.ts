@@ -3,7 +3,7 @@
 import { setTimeout as sleep } from "node:timers/promises";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { SESSION_COOKIE, SESSION_MAX_AGE, checkPassword, dashboardPassword, sessionToken } from "@/lib/auth";
+import { SESSION_COOKIE, SESSION_MAX_AGE, checkPassword, dashboardPassword, passwordProblem, sessionToken } from "@/lib/auth";
 
 export type LoginState = { error: string | null };
 
@@ -15,7 +15,8 @@ function safeNext(value: FormDataEntryValue | null): string {
 
 export async function login(_: LoginState, formData: FormData): Promise<LoginState> {
   if (!dashboardPassword()) {
-    return { error: "El dashboard no tiene contraseña. Define DASHBOARD_PASSWORD en el .env del proyecto." };
+    console.error(`[auth] ${passwordProblem()?.message}`);
+    return { error: "El acceso no está disponible. Revisa la configuración del servidor." };
   }
   const password = formData.get("password");
   if (typeof password !== "string" || !checkPassword(password)) {
