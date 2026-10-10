@@ -35,7 +35,8 @@ export class CandleSeries {
   private state: BreakState = { nextBreak: 0, broken: false };
   /** Break state just before the last candle's first point, to re-feed it. */
   private lastState: BreakState = { nextBreak: 0, broken: false };
-  private readonly mapped = new Map<string, TimePoint[]>();
+  private readonly mapped = new Map<string, { points: TimePoint[]; view: TimePoint[] }>();
+  private readonly candleView: Candle[] = [];
   hasVolume = false;
 
   constructor(
@@ -116,34 +117,51 @@ export class CandleSeries {
     return { count: k, tail };
   }
 
+  /**
+   * Candles up to `t`. Playback calls this every frame, so the result is one buffer per series,
+   * moved to the new cut in O(candles between the two cuts) instead of copied: read it before the
+   * next call, don't keep it.
+   */
   upTo(t: number): Candle[] {
     const { count, tail } = this.slice(t);
     if (!tail) return [];
     if (count === this.candles.length - 1 && tail === this.candles[count]) return this.candles;
-    const out = this.candles.slice(0, count);
-    out.push(tail);
-    return out;
+    return cut(this.candleView, this.candles, count, tail);
   }
 
   /**
    * `map` of each candle up to `t`. Complete candles are mapped once and reused (keyed by `key`), so
-   * consecutive calls return the same objects for everything but the last point.
+   * consecutive calls return the same objects for everything but the last point. Like `upTo`, the
+   * result is a reused buffer.
    */
   pointsUpTo(t: number, key: string, map: (c: Candle) => TimePoint): TimePoint[] {
     const { count, tail } = this.slice(t);
     if (!tail) return [];
     let done = this.mapped.get(key);
     if (!done) {
-      done = [];
+      done = { points: [], view: [] };
       this.mapped.set(key, done);
     }
     // Only candles before the last one are final; the last is still growing.
     const stable = Math.min(count, this.candles.length - 1);
-    for (let i = done.length; i < stable; i++) done.push(map(this.candles[i]));
-    const out = done.slice(0, count);
-    out.push(map(tail));
-    return out;
+    for (let i = done.points.length; i < stable; i++) done.points.push(map(this.candles[i]));
+    return cut(done.view, done.points, count, map(tail));
   }
+}
+
+/**
+ * Makes `view` equal to `source[0..count)` plus `tail`. `view` holds the previous cut (its last
+ * element a tail), so only the entries between the two cuts are written.
+ */
+function cut<T>(view: T[], source: T[], count: number, tail: T): T[] {
+  const shared = Math.max(0, view.length - 1);
+  if (shared > count) view.length = count;
+  else {
+    view.length = shared;
+    for (let i = shared; i < count; i++) view.push(source[i]);
+  }
+  view.push(tail);
+  return view;
 }
 
 const caches = new WeakMap<number[], Map<number, CandleSeries>>();

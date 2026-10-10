@@ -74,8 +74,13 @@ function parseElapsed(value: string): number {
   return Number(days) * 86400 + (parts[0] ?? 0) + (parts[1] ?? 0) * 60 + (parts[2] ?? 0) * 3600;
 }
 
+/** `ps` lists every process on the machine; every open tab polls, so share one listing for a while. */
+const PROCESS_SCAN_TTL_MS = 3000;
+let processScan: { at: number; found: { pid: number; startedAt: number }[] } | null = null;
+
 /** Bot processes on this machine, including ones started from a terminal. */
 function findBotProcesses(): { pid: number; startedAt: number }[] {
+  if (processScan && Date.now() - processScan.at < PROCESS_SCAN_TTL_MS) return processScan.found;
   let output = "";
   try {
     output = execFileSync("ps", ["-axo", "pid=,etime=,command="], { encoding: "utf8" });
@@ -88,8 +93,10 @@ function findBotProcesses(): { pid: number; startedAt: number }[] {
     const match = line.trim().match(/^(\d+)\s+(\S+)\s+(.*)$/);
     if (!match || !BOT_COMMAND.test(match[3])) continue;
     const pid = Number(match[1]);
-    if (pid !== process.pid) found.push({ pid, startedAt: now - parseElapsed(match[2]) });
+    // etime has whole-second resolution; rounding keeps the value stable between polls.
+    if (pid !== process.pid) found.push({ pid, startedAt: Math.round(now - parseElapsed(match[2])) });
   }
+  processScan = { at: Date.now(), found };
   return found;
 }
 
@@ -143,6 +150,7 @@ function botCommand(): [string, string[]] {
 }
 
 export async function startBot(): Promise<BotOverview> {
+  processScan = null;
   if (currentProcess().running) throw new Error("El bot ya está en marcha");
 
   const [command, args] = botCommand();
@@ -183,6 +191,7 @@ export async function startBot(): Promise<BotOverview> {
 }
 
 export function stopBot(): BotOverview {
+  processScan = null;
   const proc = currentProcess();
   if (!proc.running || !proc.pid) throw new Error("El bot no está en marcha");
   const pid = proc.pid;

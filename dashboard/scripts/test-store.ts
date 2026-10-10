@@ -257,6 +257,8 @@ async function checkCandles() {
           for (const k of ["ts", "open", "high", "low", "close"] as const) assert.equal(c[k], ref[i][k]);
           close(c.volume, ref[i].volume);
         });
+        const mapped = series.pointsUpTo(cut, "close", (c) => ({ ts: c.ts, value: c.close }));
+        assert.deepEqual(mapped.map((p) => [p.ts, p.value]), ref.map((c) => [c.ts, c.close]));
       }
     }
   }

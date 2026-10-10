@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { BotOverview } from "@/lib/bot";
+import { changedText, usePoll } from "./use-poll";
 
 const POLL_MS = 5000;
 const FAST_POLL_MS = 1500;
@@ -14,29 +15,22 @@ export function useBotStatus({ withLog = false } = {}) {
   const [now, setNow] = useState(0);
   const [pending, setPending] = useState<BotAction | null>(null);
 
-  const load = useCallback(async () => {
+  const previous = useRef<string | null>(null);
+  const load = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await fetch(`/api/bot${withLog ? "?log" : ""}`, { cache: "no-store" });
-      if (res.ok) setStatus(await res.json());
+      const res = await fetch(`/api/bot${withLog ? "?log" : ""}`, { cache: "no-store", signal });
+      if (res.ok) {
+        const text = await changedText(res, previous);
+        if (text !== null && !signal?.aborted) setStatus(JSON.parse(text));
+      }
     } catch {
       // Keep the last known status; the next poll retries.
     }
-    setNow(Date.now() / 1000);
+    if (!signal?.aborted) setNow(Date.now() / 1000);
   }, [withLog]);
 
   const stopping = status?.process.stopping ?? false;
-  useEffect(() => {
-    let cancelled = false;
-    const tick = () => {
-      if (!cancelled) load();
-    };
-    tick();
-    const id = setInterval(tick, stopping ? FAST_POLL_MS : POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [load, stopping]);
+  usePoll(load, stopping ? FAST_POLL_MS : POLL_MS, [load]);
 
   const act = useCallback(async (action: BotAction) => {
     setPending(action);
@@ -48,6 +42,7 @@ export function useBotStatus({ withLog = false } = {}) {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? res.statusText);
+      previous.current = null;
       setStatus(json);
       setNow(Date.now() / 1000);
     } finally {
@@ -70,6 +65,6 @@ export function useBotStatus({ withLog = false } = {}) {
     sinceExitSeconds,
     start: () => act("start"),
     stop: () => act("stop"),
-    refresh: load,
+    refresh: () => load(),
   };
 }
