@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -159,6 +160,11 @@ PART = re.compile(r"^(\d{8}-\d{2})-(\d+)\.parquet$")
 HOUR = re.compile(r"^(\d{8}-\d{2})\.parquet$")
 
 
+def quote(path: Path) -> str:
+    """`path` as a DuckDB string literal."""
+    return "'" + path.as_posix().replace("'", "''") + "'"
+
+
 def write_frame(frame: pd.DataFrame, path: Path, row_group_size: int | None = None) -> None:
     """Atomically write `frame` as zstd Parquet."""
     tmp = path.with_name(f".{path.name}.tmp")
@@ -182,6 +188,8 @@ class PartitionedWriter:
     """
 
     ROW_GROUP_SIZE = 32_768
+    #: DuckDB memory budget for merging an hour of parts.
+    COMPACT_MEMORY = "128MB"
 
     def __init__(
         self,
@@ -247,17 +255,25 @@ class PartitionedWriter:
                 parts.setdefault(m.group(1), []).append(path)
         for hour, files in parts.items():
             final = self.directory / f"{hour}.parquet"
+            tmp = final.with_name(f".{final.name}.tmp")
             sources = ([final] if final.exists() else []) + sorted(files)
-            listing = ", ".join("'" + p.as_posix().replace("'", "''") + "'" for p in sources)
+            listing = ", ".join(quote(p) for p in sources)
+            spill = self.directory / ".compact_tmp"
             con = duckdb.connect()
             try:
-                frame = con.execute(
-                    f"SELECT * FROM read_parquet([{listing}], union_by_name=true) "
-                    f"ORDER BY {self.ts_column}"
-                ).fetchdf()
+                # Read, sort and write inside DuckDB: an hour never becomes Python objects, and a
+                # sort larger than the budget spills to disk instead of growing the process.
+                con.execute(f"SET memory_limit = '{self.COMPACT_MEMORY}'")
+                con.execute(f"SET temp_directory = {quote(spill)}")
+                con.execute(
+                    f"COPY (SELECT * FROM read_parquet([{listing}], union_by_name=true) "
+                    f"ORDER BY {self.ts_column}) TO {quote(tmp)} "
+                    f"(FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE {self.ROW_GROUP_SIZE})"
+                )
             finally:
                 con.close()
-            write_frame(frame, final, self.ROW_GROUP_SIZE)
+                shutil.rmtree(spill, ignore_errors=True)
+            os.replace(tmp, final)
             for path in files:
                 path.unlink(missing_ok=True)
 

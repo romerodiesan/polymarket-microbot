@@ -65,6 +65,39 @@ def test_partitioned_writer_writes_hourly_parts_then_compacts(tmp_path):
         "20261008-21.parquet", "20261008-22.parquet"]
 
 
+def test_compaction_merges_late_parts_sorted_in_row_groups(tmp_path):
+    directory = tmp_path / "book_events"
+    writer = PartitionedWriter(directory, BOOK_EVENT_COLUMNS, "recv_ts", flush_seconds=60)
+    size = writer.ROW_GROUP_SIZE
+    total = 2 * size + 1000
+    # Three parts with interleaved times, each written in its own flush.
+    for offset in (2, 0, 1):
+        seqs = [i * 3 + offset for i in range(total // 3)]
+        writer.extend(book_row(HOUR + seq * 0.01, seq) for seq in seqs)
+        writer.flush(now=HOUR + 30)
+    writer.flush(now=HOUR + 3601)
+    # A late part of the same hour merges with the already compacted file.
+    writer.extend([book_row(HOUR + 0.001, -1)])
+    writer.flush(now=HOUR + 3602)
+
+    names = sorted(p.name for p in directory.iterdir())
+    assert names == ["20261008-21.parquet"]
+    final = (directory / "20261008-21.parquet").as_posix()
+    con = duckdb.connect()
+    rows = con.execute(f"SELECT recv_ts, seq FROM read_parquet('{final}')").fetchall()
+    expected = 3 * (total // 3) + 1
+    assert len(rows) == expected
+    assert [ts for ts, _ in rows] == sorted(ts for ts, _ in rows)
+    assert rows[0][1] == 0 and rows[1][1] == -1
+    groups = [n for _, n in con.execute(
+        f"SELECT DISTINCT row_group_id, row_group_num_rows FROM parquet_metadata('{final}') "
+        "ORDER BY row_group_id").fetchall()]
+    assert max(groups) <= size and sum(groups) == expected and len(groups) >= 3
+    kinds = {name: kind for name, kind, *_ in con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{final}')").fetchall()}
+    assert (kinds["is_delta"], kinds["seq"], kinds["price"]) == ("BOOLEAN", "BIGINT", "DOUBLE")
+
+
 def test_partitioned_writer_only_flushes_on_interval_and_prunes(tmp_path):
     directory = tmp_path / "book_events"
     writer = PartitionedWriter(directory, BOOK_EVENT_COLUMNS, "recv_ts", flush_seconds=60,

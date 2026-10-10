@@ -135,6 +135,25 @@ def polymarket_fee(fee_rate: float, size: float, price: float, exponent: float =
     return round(size * fee_rate * (price * (1 - price)) ** exponent, FEE_DECIMALS)
 
 
+def venue_fee(trades: list[dict], rate: float, exponent: float, source: str) -> tuple[float, str]:
+    """Taker fee of the trades the venue matched, each at its own price.
+
+    The CLOB reports the rate it applied (`fee_rate_bps`) but not the amount: trades it marks
+    with 0 bps paid nothing, the others pay the market's schedule on their own price and size.
+    """
+    fee = 0.0
+    charged = 0
+    for trade in trades:
+        bps = trade.get("fee_rate_bps")
+        if bps is not None and float(bps) == 0:
+            continue
+        charged += 1
+        fee += polymarket_fee(rate, float(trade["size"]), float(trade["price"]), exponent)
+    if not charged:
+        return 0.0, "venue:fee_rate_bps=0"
+    return round(fee, FEE_DECIMALS), f"venue:{len(trades)} trades ({source})"
+
+
 @dataclass(slots=True)
 class FeeSchedule:
     """Fee rate (and exponent) per token; tokens without an entry use the configured default."""
@@ -298,10 +317,14 @@ class LiveBroker:
         venue_id = str(result.get("orderID", ""))
         if venue_id:
             order.order_id = venue_id
-        filled, price = await self.reconcile(venue_id, intent)
+        filled, price, trades = await self.reconcile(venue_id, intent)
         rate, source, exponent = self.fees.get(intent.token_id)
-        fee = polymarket_fee(rate, filled, price, exponent) if filled else 0.0
-        order.fee_rate, order.fee_source = rate, f"{source}:estimated"
+        if filled and trades:
+            fee, order.fee_source = venue_fee(trades, rate, exponent, source)
+        else:
+            fee = polymarket_fee(rate, filled, price, exponent) if filled else 0.0
+            order.fee_source = f"{source}:estimated"
+        order.fee_rate = rate
         order.finish(filled, price if filled else None, fee, time())
         if filled <= 0:
             order.reject_reason = "no_match"
@@ -311,8 +334,11 @@ class LiveBroker:
                     "live", intent.reason, pnl, "taker", rate, order.fee_source)
         return Execution(order, fill)
 
-    async def reconcile(self, venue_id: str, intent: Intent) -> tuple[float, float]:
-        """Matched size and average price reported by the venue for a FAK order."""
+    async def reconcile(self, venue_id: str, intent: Intent) -> tuple[float, float, list[dict]]:
+        """Matched size, average price and the venue's trades for a FAK order.
+
+        The trades list is empty when they could not be read; the fee is then estimated.
+        """
         from asyncio import to_thread
 
         try:
@@ -321,24 +347,24 @@ class LiveBroker:
             log.warning("Could not reconcile order %s (%s); booking the limit", venue_id, exc)
             data = None
         if not data:
-            return intent.size, intent.limit_price
+            return intent.size, intent.limit_price, []
         filled = float(data.get("size_matched") or 0)
         price = float(data.get("price") or intent.limit_price)
-        trades = data.get("associate_trades") or []
-        if filled and trades:
+        trade_ids = data.get("associate_trades") or []
+        trades: list[dict] = []
+        if filled and trade_ids:
             try:
                 from py_clob_client.clob_types import TradeParams
 
-                notional = size = 0.0
-                for trade_id in trades:
-                    for trade in await to_thread(self.client.get_trades, TradeParams(id=trade_id)):
-                        notional += float(trade["size"]) * float(trade["price"])
-                        size += float(trade["size"])
+                for trade_id in trade_ids:
+                    trades.extend(await to_thread(self.client.get_trades, TradeParams(id=trade_id)))
+                size = sum(float(t["size"]) for t in trades)
                 if size:
-                    price = notional / size
+                    price = sum(float(t["size"]) * float(t["price"]) for t in trades) / size
             except Exception as exc:  # noqa: BLE001
                 log.warning("Could not read trades of %s (%s)", venue_id, exc)
-        return filled, price
+                trades = []
+        return filled, price, trades
 
     def settle(self, token_id: str, payout: float, ts: float, order_id: str) -> Fill | None:
         size = self.position(token_id)

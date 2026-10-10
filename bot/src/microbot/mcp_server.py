@@ -62,7 +62,10 @@ INSTRUCTIONS = (
     "evaluations. Check data quality, stream health, execution quality, fees, settled P&L "
     "and temporal comparability before recommending algorithm changes. Never claim that a "
     "model is profitable based only on classification metrics; rely on settled P&L and "
-    "pessimistic evaluation scenarios over many markets."
+    "pessimistic evaluation scenarios over many markets. P&L, execution, equity and "
+    "prediction tools cover every tracked bot run by default (rows recorded before run "
+    "tracking are excluded and counted in `scope`); pass run_id (see get_capture_status "
+    "bot_runs, or \"latest\") to compare runs."
 )
 
 
@@ -126,6 +129,42 @@ def optional_relation(table: str) -> str | None:
         return None
     relation = parquet_relation(table)
     return relation if query(f"SELECT count(*) AS n FROM {relation}")[0]["n"] else None
+
+
+def sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def latest_run_id() -> str | None:
+    runs = optional_relation("runs")
+    if runs is None:
+        return None
+    rows = query(f"SELECT run_id FROM {runs} ORDER BY started_at DESC NULLS LAST LIMIT 1")
+    return rows[0]["run_id"] if rows else None
+
+
+def scoped(table: str, run_id: str | None = None,
+           include_legacy: bool = False) -> tuple[str | None, dict[str, Any]]:
+    """The table's relation restricted to one bot run (`run_id`, or "latest"), or to every
+    tracked run; rows without a run_id predate run tracking (and per-fill fee records) and are
+    left out unless `include_legacy`. Returns the relation (None if empty) and the scope used."""
+    relation = optional_relation(table)
+    scope: dict[str, Any] = {"run_id": run_id, "include_legacy": include_legacy,
+                             "legacy_rows_excluded": 0}
+    if relation is None or "run_id" not in columns(relation):
+        return relation, scope
+    if run_id == "latest":
+        run_id = latest_run_id()
+        scope["run_id"] = run_id
+    if run_id:
+        condition = f"run_id = {sql_literal(run_id)}"
+    elif include_legacy:
+        return relation, scope
+    else:
+        condition = "run_id IS NOT NULL"
+        scope["legacy_rows_excluded"] = query(
+            f"SELECT count(*) AS n FROM {relation} WHERE run_id IS NULL")[0]["n"]
+    return f"(SELECT * FROM {relation} WHERE {condition})", scope
 
 
 def columns(relation: str) -> set[str]:
@@ -216,10 +255,18 @@ def get_capture_status() -> dict[str, Any]:
             "rows": rows,
         }
 
+    runs = optional_relation("runs")
+    bot_runs = query(
+        f"SELECT run_id, started_at, ended_at, mode, git_commit, version, features_version, "
+        f"model_version, fee_rate, starting_cash FROM {runs} "
+        "ORDER BY started_at DESC NULLS LAST LIMIT 20"
+    ) if runs else []
+
     pid = state.get("pid")
     return {
         **public_env(),
         "data_dir": str(DATA_DIR),
+        "bot_runs": bot_runs,
         "updated_at": updated_at,
         "status_age_seconds": None if updated_at is None else max(0, time() - updated_at),
         "process": {
@@ -340,17 +387,21 @@ def payouts_sql() -> str:
     """
 
 
-def get_paper_performance(lookback_hours: float = 168) -> dict[str, Any]:
+def get_paper_performance(lookback_hours: float = 168, run_id: str | None = None,
+                          include_legacy: bool = False) -> dict[str, Any]:
     """Paper P&L split into settled (resolved markets at their 0/1 payout) and marked (pending
-    markets at the latest midpoint), with fees, their source and ROI on committed capital."""
+    markets at the latest midpoint), with fees, their source and ROI on committed capital.
+    `run_id` limits it to one bot run ("latest" for the last); fills recorded before run
+    tracking are excluded unless `include_legacy`."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 365)
     empty_totals = {"fills": 0, "fees": 0.0, "realized_pnl": 0.0, "settled_pnl": 0.0,
                     "marked_pnl": 0.0, "net_pnl": 0.0}
-    if not parquet_files("fills"):
-        return {"lookback_hours": lookback_hours, "tokens": [], "reasons": [], "totals": empty_totals}
+    fills, scope = scoped("fills", run_id, include_legacy)
+    if fills is None:
+        return {"lookback_hours": lookback_hours, "scope": scope, "tokens": [], "reasons": [],
+                "totals": empty_totals}
 
     cutoff = time() - lookback_hours * 3600
-    fills = parquet_relation("fills")
     features = parquet_relation("features") if parquet_files("features") else None
     marks = (
         f"SELECT token_id, arg_max(midpoint, ts) AS mark_price, max(ts) AS mark_ts "
@@ -405,7 +456,7 @@ def get_paper_performance(lookback_hours: float = 168) -> dict[str, Any]:
             """,
             [cutoff],
         )
-    equity = optional_relation("equity")
+    equity, _ = scoped("equity", scope["run_id"], include_legacy)
     committed = (
         query(f"SELECT max(max_simultaneous_exposure) AS c FROM {equity} WHERE ts >= ?",
               [cutoff])[0]["c"]
@@ -425,6 +476,7 @@ def get_paper_performance(lookback_hours: float = 168) -> dict[str, Any]:
     marked = sum(float(r["marked_pnl"] or 0) for r in rows if r["valuation"] == "midpoint")
     return {
         "lookback_hours": lookback_hours,
+        "scope": scope,
         "tokens": rows,
         "reasons": reasons,
         "fee_sources": fee_sources,
@@ -452,10 +504,12 @@ def unavailable(table: str) -> dict[str, Any]:
             "note": f"No {table} recorded yet; they are written by bots started after this upgrade."}
 
 
-def get_execution_quality(lookback_hours: float = 168) -> dict[str, Any]:
-    """Fill rate, partial fills, rejections, slippage, latency and fees by market and reason."""
+def get_execution_quality(lookback_hours: float = 168, run_id: str | None = None,
+                          include_legacy: bool = False) -> dict[str, Any]:
+    """Fill rate, partial fills, rejections, slippage, latency and fees by market, reason and
+    fee source. `run_id` limits it to one bot run ("latest" for the last)."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 365)
-    orders = optional_relation("orders")
+    orders, scope = scoped("orders", run_id, include_legacy)
     if orders is None:
         return unavailable("orders")
     cutoff = time() - lookback_hours * 3600
@@ -477,7 +531,12 @@ def get_execution_quality(lookback_hours: float = 168) -> dict[str, Any]:
     selected = f"SELECT *, split_part(reason, ' ', 1) AS reason_kind FROM {orders} WHERE submit_ts >= ?"
     return {
         "lookback_hours": lookback_hours,
+        "scope": scope,
         "totals": query(f"SELECT {aggregate} FROM ({selected})", [cutoff])[0],
+        "by_fee_source": query(
+            f"SELECT coalesce(fee_source, 'unknown') AS fee_source, count(*) AS orders, "
+            "sum(fee) AS fees, avg(fee_rate) AS avg_fee_rate "
+            f"FROM ({selected}) WHERE filled_size > 0 GROUP BY 1 ORDER BY 2 DESC", [cutoff]),
         "by_reason": query(
             f"SELECT mode, side, reason_kind, {aggregate} FROM ({selected}) "
             "GROUP BY ALL ORDER BY orders DESC", [cutoff]),
@@ -487,17 +546,22 @@ def get_execution_quality(lookback_hours: float = 168) -> dict[str, Any]:
         "reject_reasons": query(
             f"SELECT reject_reason, count(*) AS orders FROM ({selected}) "
             "WHERE status = 'rejected' GROUP BY 1 ORDER BY 2 DESC", [cutoff]),
-        "note": "Taker FAK orders only: queue_ahead/queue_time_ms are null by design.",
+        "note": "Taker FAK orders only: queue_ahead/queue_time_ms are null by design. "
+                "fee_source 'venue:…' = fee from the trades the CLOB matched (each at its own "
+                "price, 0 where the venue applied 0 bps); '…:estimated' = trades unreadable, "
+                "computed on the average price; paper fills use the market's fee schedule.",
     }
 
 
-def get_market_resolutions(limit: int = 50) -> dict[str, Any]:
-    """Official resolutions (0/1 payouts), BTC start/end prices and the bot's P&L per market."""
+def get_market_resolutions(limit: int = 50, run_id: str | None = None,
+                           include_legacy: bool = False) -> dict[str, Any]:
+    """Official resolutions (0/1 payouts), BTC start/end prices and the bot's P&L per market.
+    `run_id` limits the P&L to one bot run ("latest" for the last)."""
     limit = max(1, min(int(limit), MAX_ROWS))
     markets = optional_relation("markets")
     if markets is None:
         return unavailable("markets")
-    fills = optional_relation("fills")
+    fills, scope = scoped("fills", run_id, include_legacy)
     pnl = (f"SELECT market AS slug, sum(coalesce(pnl, 0)) AS pnl, sum(fee) AS fees, "
            f"count(*) AS fills FROM {fills} WHERE mode = 'paper' GROUP BY market"
            if fills else "SELECT NULL::VARCHAR AS slug, 0.0 AS pnl, 0.0 AS fees, 0 AS fills WHERE false")
@@ -522,14 +586,16 @@ def get_market_resolutions(limit: int = 50) -> dict[str, Any]:
         FROM {markets}
         """
     )[0]
-    return {"summary": summary, "markets": rows}
+    return {"scope": scope, "summary": summary, "markets": rows}
 
 
-def get_equity_and_risk(lookback_hours: float = 168, points: int = 200) -> dict[str, Any]:
-    """Equity curve (subsampled), drawdown, exposure, committed capital and open positions."""
+def get_equity_and_risk(lookback_hours: float = 168, points: int = 200,
+                        run_id: str | None = None) -> dict[str, Any]:
+    """Equity curve (subsampled), drawdown, exposure, max capital committed at once and open
+    positions. `run_id` limits it to one bot run ("latest" for the last)."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 365)
     points = max(10, min(int(points), MAX_ROWS))
-    equity = optional_relation("equity")
+    equity, scope = scoped("equity", run_id)
     if equity is None:
         return unavailable("equity snapshots")
     cutoff = time() - lookback_hours * 3600
@@ -558,25 +624,26 @@ def get_equity_and_risk(lookback_hours: float = 168, points: int = 200) -> dict[
         """,
         [cutoff],
     )[0]
-    positions = optional_relation("positions")
+    positions, _ = scoped("positions", scope["run_id"])
     open_positions = (
         query(f"SELECT * FROM {positions} WHERE ts = (SELECT max(ts) FROM {positions})")
         if positions else []
     )
-    return {"lookback_hours": lookback_hours, "stats": stats, "curve": curve,
+    return {"lookback_hours": lookback_hours, "scope": scope, "stats": stats, "curve": curve,
             "latest_positions": open_positions,
             "note": "equity = cash + positions at midpoint; drawdown is from the running peak "
                     "within each bot run (snapshots restart with each run_id)."}
 
 
 def get_prediction_calibration(horizon_seconds: float = 15, lookback_hours: float = 168,
-                               bins: int = 10) -> dict[str, Any]:
+                               bins: int = 10, run_id: str | None = None) -> dict[str, Any]:
     """Reliability of logged predictions against the midpoint `horizon_seconds` later, by
-    decision, plus how often entered tokens resolved to 1."""
+    decision, plus how often entered tokens resolved to 1. `run_id` limits it to one bot run
+    ("latest" for the last)."""
     lookback_hours = clamp_hours(lookback_hours, 24 * 365)
     horizon_seconds = max(1.0, min(float(horizon_seconds), 3600.0))
     bins = max(2, min(int(bins), 20))
-    predictions = optional_relation("predictions")
+    predictions, scope = scoped("predictions", run_id)
     if predictions is None or not parquet_files("features"):
         return unavailable("predictions")
     features = parquet_relation("features")
@@ -638,6 +705,7 @@ def get_prediction_calibration(horizon_seconds: float = 15, lookback_hours: floa
         )
     return {
         "horizon_seconds": horizon_seconds,
+        "scope": scope,
         "labelled_predictions": total,
         "brier": (sum(r["brier"] * r["predictions"] for r in by_decision) / total) if total else None,
         "ece": ece,

@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from microbot.book import OrderBook
-from microbot.broker import OrderContext, PaperBroker, polymarket_fee
+from microbot.broker import OrderContext, PaperBroker, polymarket_fee, venue_fee
 from microbot.config import Settings
 from microbot.strategy import Intent
 
@@ -70,6 +70,23 @@ def test_fee_uses_token_rate_and_rounds_to_five_decimals():
     assert execution.fill.fee == pytest.approx(round(2 * 0.07 * 0.51 * 0.49, 5))
     assert execution.fill.fee_source == execution.order.fee_source == "clob:base_fee=1000"
     assert b.cash == pytest.approx(1000 - 2 * 0.51 - execution.fill.fee)
+
+
+def test_venue_fee_charges_each_trade_at_its_own_price():
+    trades = [{"size": "2", "price": "0.5", "fee_rate_bps": "1000"},
+              {"size": "3", "price": "0.9", "fee_rate_bps": "1000"}]
+    fee, source = venue_fee(trades, 0.07, 1.0, "gamma:feeSchedule")
+    assert fee == pytest.approx(polymarket_fee(0.07, 2, 0.5) + polymarket_fee(0.07, 3, 0.9))
+    # p * (1 - p) isn't linear, so the average price (0.74) would misstate the fee.
+    assert fee != pytest.approx(polymarket_fee(0.07, 5, 0.74))
+    assert source == "venue:2 trades (gamma:feeSchedule)"
+
+
+def test_venue_fee_is_zero_when_the_venue_applied_no_rate():
+    trades = [{"size": "2", "price": "0.5", "fee_rate_bps": "0"}]
+    assert venue_fee(trades, 0.07, 1.0, "gamma:feeSchedule") == (0.0, "venue:fee_rate_bps=0")
+    mixed = trades + [{"size": "1", "price": "0.5"}]
+    assert venue_fee(mixed, 0.07, 1.0, "x")[0] == pytest.approx(polymarket_fee(0.07, 1, 0.5))
 
 
 def test_haircut_and_extra_slippage_make_fills_worse():

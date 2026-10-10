@@ -50,10 +50,15 @@ def server(tmp_path, monkeypatch):
     storage.insert("fills", {"ts": NOW - 300, "token_id": UP, "side": "BUY", "size": 5.0,
                              "price": 0.51, "fee": 0.0875, "order_id": "o1", "mode": "paper",
                              "reason": "entry", "pnl": 0.0, "market": "btc-1", "outcome": "YES",
-                             "fee_rate": 0.07, "fee_source": "gamma:feeSchedule"})
+                             "fee_rate": 0.07, "fee_source": "gamma:feeSchedule", "run_id": "r1"})
     storage.insert("fills", {"ts": NOW - 250, "token_id": "u2", "side": "BUY", "size": 2.0,
                              "price": 0.40, "fee": 0.0, "order_id": "o3", "mode": "paper",
-                             "reason": "entry", "pnl": 0.0, "market": "btc-2", "outcome": "YES"})
+                             "reason": "entry", "pnl": 0.0, "market": "btc-2", "outcome": "YES",
+                             "run_id": "r1"})
+    # Recorded before run tracking: no run_id and no fee record.
+    storage.insert("fills", {"ts": NOW - 280, "token_id": UP, "side": "BUY", "size": 1.0,
+                             "price": 0.50, "fee": 0.0, "order_id": "old", "mode": "paper",
+                             "reason": "entry", "pnl": 0.0, "market": "btc-1", "outcome": "YES"})
     for i, (equity, exposure) in enumerate(((1000.0, 0.0), (999.0, 2.6), (1001.0, 3.4))):
         storage.insert("equity", {"ts": NOW - 300 + i, "run_id": "r1", "starting_cash": 1000,
                                   "cash": 997, "equity": equity, "drawdown": max(0, 1000 - equity),
@@ -94,6 +99,27 @@ def test_paper_performance_separates_settled_and_marked(server):
     assert perf["totals"]["roi_on_max_committed"] == pytest.approx(perf["totals"]["net_pnl"] / 3.4)
     sources = {s["fee_source"] for s in perf["fee_sources"]}
     assert sources == {"gamma:feeSchedule", "unknown"}
+    assert perf["scope"]["legacy_rows_excluded"] == 1
+
+
+def test_run_scope_filters_legacy_rows_and_resolves_latest(server):
+    tracked = server.get_paper_performance(lookback_hours=1)
+    everything = server.get_paper_performance(lookback_hours=1, include_legacy=True)
+    # The legacy fill bought 1 share of the YES token at 0.50, which paid out 1.
+    assert everything["totals"]["settled_pnl"] == pytest.approx(
+        tracked["totals"]["settled_pnl"] + 0.5)
+    assert everything["totals"]["fills"] == tracked["totals"]["fills"] + 1
+
+    latest = server.get_paper_performance(lookback_hours=1, run_id="latest")
+    assert latest["scope"]["run_id"] == "r1"
+    assert latest["totals"]["settled_pnl"] == pytest.approx(tracked["totals"]["settled_pnl"])
+    assert server.get_paper_performance(lookback_hours=1, run_id="nope")["totals"]["fills"] == 0
+    assert server.get_equity_and_risk(lookback_hours=1, run_id="latest")["scope"]["run_id"] == "r1"
+    assert [r["run_id"] for r in server.get_capture_status()["bot_runs"]] == ["r1"]
+
+    resolutions = server.get_market_resolutions(include_legacy=True)
+    by_slug = {m["slug"]: m for m in resolutions["markets"]}
+    assert by_slug["btc-1"]["fills"] == 2
 
 
 def test_execution_quality(server):
@@ -103,6 +129,8 @@ def test_execution_quality(server):
     assert quality["totals"]["size_fill_ratio"] == pytest.approx(5 / 15)
     assert quality["reject_reasons"] == [{"reject_reason": "no_liquidity_within_limit", "orders": 1}]
     assert {r["reason_kind"] for r in quality["by_reason"]} == {"entry", "stop_loss"}
+    assert quality["by_fee_source"] == [
+        {"fee_source": "unknown", "orders": 1, "fees": pytest.approx(0.0875), "avg_fee_rate": None}]
 
 
 def test_market_resolutions_and_equity(server):
