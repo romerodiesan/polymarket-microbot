@@ -1,8 +1,18 @@
 import "server-only";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
+import { open } from "node:fs/promises";
 import path from "node:path";
+import { parquetMetadataAsync } from "hyparquet";
 import { ROOT, activeTokens, lookupMarket, parquetPaths, readEnvFile } from "./data";
-import { FEATURE_COLUMNS, type FeatureIndex, type FeatureStore, featureIndex, featureStore, fillsStore } from "./store";
+import {
+  FEATURE_COLUMNS,
+  type FeatureIndex,
+  type FeatureStore,
+  featureIndex,
+  featureStore,
+  fillsStore,
+  readTable,
+} from "./store";
 
 export { FEATURE_COLUMNS };
 
@@ -12,6 +22,12 @@ const MIN_TRAINING_ROWS = 1000;
 const DEFAULT_HORIZON_SECONDS = 15;
 const DEFAULT_MIN_MOVE = 0.002;
 const RECENT_ROWS = 50;
+const HEALTH_WINDOW_SECONDS = 24 * 3600;
+const MAX_RTT_POINTS = 500;
+const RECENT_STREAM_EVENTS = 50;
+/** Tables the bot exports next to features and fills. */
+const EXTRA_TABLES = ["orders", "markets", "equity", "positions", "predictions", "stream_events", "runs"];
+const BOOK_FILE = /^(\d{8})-(\d{2})(?:-\d+)?\.parquet$/;
 
 type Row = Record<string, number | string>;
 
@@ -39,6 +55,32 @@ export type RowBucket = { ts: number; rows: number };
 
 export type FileInfo = { name: string; bytes: number; modifiedAt: number } | null;
 
+export type StreamEvent = { ts: number; kind: string; token: string | null; value: number | null; detail: string | null };
+
+export type StreamHealth = {
+  /** Start of the window the counts cover. */
+  since: number;
+  counts: Record<string, number>;
+  rttP50: number | null;
+  rttP95: number | null;
+  rtt: { ts: number; value: number }[];
+  recent: StreamEvent[];
+};
+
+export type BookDisk = {
+  directory: string;
+  files: number;
+  bytes: number;
+  rows: number;
+  /** UTC hours with data, as YYYYMMDD-HH. */
+  firstHour: string | null;
+  lastHour: string | null;
+  hours: number;
+  retentionDays: number;
+  /** UTC days, chronological. */
+  perDay: { day: string; bytes: number; rows: number }[];
+};
+
 export type CollectionData = {
   market: { question: string | null; url: string | null };
   totalRows: number;
@@ -62,6 +104,8 @@ export type CollectionData = {
   };
   files: FileInfo[];
   recent: Row[];
+  stream: StreamHealth;
+  book: BookDisk;
 };
 
 function fileInfo(file: string): FileInfo {
@@ -231,11 +275,120 @@ class CollectionAggregates {
 
 const aggregates = new WeakMap<FeatureStore, CollectionAggregates>();
 
+function quantile(sorted: number[], q: number) {
+  return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] : null;
+}
+
+async function streamHealth(file: string): Promise<StreamHealth> {
+  const rows = await readTable(file, ["ts", "kind", "token_id", "value", "detail"]);
+  const events: StreamEvent[] = rows
+    .map((r) => ({
+      ts: Number(r.ts),
+      kind: String(r.kind ?? ""),
+      token: r.token_id == null ? null : String(r.token_id),
+      value: r.value == null ? null : Number(r.value),
+      detail: r.detail == null || r.detail === "" ? null : String(r.detail),
+    }))
+    .sort((a, b) => a.ts - b.ts);
+  // Whole minutes, so unchanged data gives an identical response the client can skip.
+  const since = Math.floor(Date.now() / 60_000) * 60 - HEALTH_WINDOW_SECONDS;
+  const counts: Record<string, number> = {};
+  const rtt: { ts: number; value: number }[] = [];
+  for (const e of events) {
+    if (e.ts < since) continue;
+    counts[e.kind] = (counts[e.kind] ?? 0) + 1;
+    if (e.kind === "rtt" && e.value != null) rtt.push({ ts: e.ts, value: e.value });
+  }
+  const sorted = rtt.map((r) => r.value).sort((a, b) => a - b);
+  const stride = Math.ceil(rtt.length / MAX_RTT_POINTS);
+  return {
+    since,
+    counts,
+    rttP50: quantile(sorted, 0.5),
+    rttP95: quantile(sorted, 0.95),
+    rtt: stride > 1 ? rtt.filter((_, i) => i % stride === 0) : rtt,
+    recent: events.filter((e) => e.kind !== "rtt").slice(-RECENT_STREAM_EVENTS).reverse(),
+  };
+}
+
+const rowCounts = new Map<string, { key: string; rows: number }>();
+
+/** Rows of a Parquet file from its footer, cached by mtime and size. */
+async function parquetRows(file: string, key: string): Promise<number> {
+  const cached = rowCounts.get(file);
+  if (cached?.key === key) return cached.rows;
+  const handle = await open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const metadata = await parquetMetadataAsync({
+      byteLength: size,
+      async slice(start, end = size) {
+        const bytes = Buffer.allocUnsafe(end - start);
+        await handle.read(bytes, 0, bytes.length, start);
+        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+      },
+    });
+    const rows = Number(metadata.num_rows);
+    rowCounts.set(file, { key, rows });
+    return rows;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function bookDisk(directory: string, retentionDays: number): Promise<BookDisk> {
+  const out: BookDisk = {
+    directory: path.relative(ROOT, directory),
+    files: 0,
+    bytes: 0,
+    rows: 0,
+    firstHour: null,
+    lastHour: null,
+    hours: 0,
+    retentionDays,
+    perDay: [],
+  };
+  if (!existsSync(directory)) return out;
+  const hours = new Set<string>();
+  const days = new Map<string, { bytes: number; rows: number }>();
+  for (const name of readdirSync(directory).sort()) {
+    const m = name.match(BOOK_FILE);
+    if (!m) continue;
+    const file = path.join(directory, name);
+    let info;
+    try {
+      info = statSync(file);
+    } catch {
+      continue; // compacted between listing and stat
+    }
+    const rows = await parquetRows(file, `${info.mtimeMs}:${info.size}`).catch(() => 0);
+    out.files++;
+    out.bytes += info.size;
+    out.rows += rows;
+    hours.add(`${m[1]}-${m[2]}`);
+    const day = days.get(m[1]) ?? { bytes: 0, rows: 0 };
+    day.bytes += info.size;
+    day.rows += rows;
+    days.set(m[1], day);
+  }
+  const sortedHours = [...hours].sort();
+  out.hours = sortedHours.length;
+  out.firstHour = sortedHours[0] ?? null;
+  out.lastHour = sortedHours.at(-1) ?? null;
+  out.perDay = [...days.entries()].sort().map(([day, v]) => ({ day, ...v }));
+  return out;
+}
+
 export async function loadCollection(): Promise<CollectionData> {
   const env = readEnvFile();
   const dbPath = path.resolve(/*turbopackIgnore: true*/ ROOT, env.PM_DB_PATH || "data/microbot.duckdb");
-  const { featuresFile, fillsFile } = parquetPaths(env);
-  const [store, fills] = await Promise.all([featureStore(featuresFile), fillsStore(fillsFile)]);
+  const { featuresFile, fillsFile, parquetDir, table } = parquetPaths(env);
+  const [store, fills, stream, book] = await Promise.all([
+    featureStore(featuresFile),
+    fillsStore(fillsFile),
+    streamHealth(table("stream_events")),
+    bookDisk(path.join(parquetDir, "book_events"), Number(env.PM_BOOK_RETENTION_DAYS || 14)),
+  ]);
   const index = featureIndex(store);
   let agg = aggregates.get(store);
   if (!agg) {
@@ -321,7 +474,9 @@ export async function loadCollection(): Promise<CollectionData> {
       ups,
       downs,
     },
-    files: [dbPath, `${dbPath}.wal`, featuresFile, fillsFile].map(fileInfo),
+    files: [dbPath, `${dbPath}.wal`, featuresFile, fillsFile, ...EXTRA_TABLES.map(table)].map(fileInfo),
     recent,
+    stream,
+    book,
   };
 }

@@ -21,9 +21,86 @@ const LOG_TAIL_BYTES = 64 * 1024;
 export type RunStatus = "running" | "succeeded" | "failed" | "stopped" | "interrupted";
 
 /** `horizonSamples` only exists on runs created before the horizon moved to seconds. */
-export type RunParams = { horizonSeconds?: number; horizonSamples?: number; minMove: number };
+export type RunParams = {
+  horizonSeconds?: number;
+  horizonSamples?: number;
+  minMove: number;
+  holdoutMarkets?: number;
+  folds?: number;
+  embargoMarkets?: number;
+};
 
-export type RunMetrics = {
+export type ClassMetrics = {
+  rows: number;
+  roc_auc?: number | null;
+  log_loss?: number;
+  brier?: number;
+  accuracy?: number;
+  high_confidence_coverage?: number;
+  high_confidence_accuracy?: number | null;
+};
+
+export type Reliability = {
+  bins: { low: number; high: number; rows: number; mean_probability: number; observed_rate: number }[];
+  ece: number;
+};
+
+export type ThresholdResult = { threshold: number; coverage: number; accuracy: number | null };
+
+export type Interval = { low: number; high: number } | null;
+
+/** Fields written by the market-split trainer; absent on older runs. */
+export type MarketSplitMetrics = {
+  model_version?: string;
+  features_version?: string;
+  split?: {
+    unit: string;
+    dev_markets: number;
+    test_markets: number;
+    embargo_markets: string[];
+    embargo_seconds: number;
+    markets_total: number;
+    dev_rows: number;
+  };
+  walk_forward?: (ClassMetrics & {
+    fold: number;
+    train_markets: number;
+    valid_markets: number;
+    train_rows: number;
+    valid_rows: number;
+  })[];
+  validation?: {
+    markets: number;
+    rows: number;
+    train_rows: number;
+    method: string;
+    raw: Reliability;
+    calibrated: Reliability;
+    threshold: ThresholdResult;
+  };
+  test?: {
+    raw: ClassMetrics;
+    calibrated: ClassMetrics;
+    reliability_raw: Reliability;
+    reliability: Reliability;
+    threshold: ThresholdResult;
+  };
+  baselines?: Record<string, ClassMetrics>;
+  per_market?: {
+    markets: number;
+    accuracy: { mean: number; median: number; p10: number; p90: number; share_above_half: number } | null;
+    rows: { market: string; rows: number; accuracy: number; brier: number; roc_auc: number | null }[];
+  };
+  bootstrap?: {
+    markets: number;
+    samples: number;
+    roc_auc: Interval;
+    accuracy: Interval;
+    brier: Interval;
+  };
+};
+
+export type RunMetrics = MarketSplitMetrics & {
   roc_auc: number;
   rows_total: number;
   rows_labelled: number;
@@ -167,6 +244,9 @@ export function startRun(params: RunParams): Run {
     "--horizon-seconds", String(params.horizonSeconds),
     "--min-move", String(params.minMove),
   ];
+  if (params.holdoutMarkets !== undefined) args.push("--holdout-markets", String(params.holdoutMarkets));
+  if (params.folds !== undefined) args.push("--folds", String(params.folds));
+  if (params.embargoMarkets !== undefined) args.push("--embargo-markets", String(params.embargoMarkets));
 
   writeFileSync(logFile(id), `$ ${pythonBin()} ${args.join(" ")}\n`);
   const out = openSync(logFile(id), "a");

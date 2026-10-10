@@ -1,5 +1,6 @@
 "use client";
 
+import { memo, useMemo } from "react";
 import { type Column, DataTable } from "@/components/app/data-table";
 import { Signed, ToneBadge, TokenBadge } from "@/components/app/indicators";
 import type { BotMeta } from "@/lib/data";
@@ -14,6 +15,7 @@ const REASONS: Record<string, string> = {
   signal_reversal: "Señal invertida",
   signal_faded: "Señal agotada",
   rollover: "Cambio de mercado",
+  settlement: "Liquidación",
 };
 
 function fillColumns(tokens: BotMeta["tokens"]): Column<Fill>[] {
@@ -24,7 +26,12 @@ function fillColumns(tokens: BotMeta["tokens"]): Column<Fill>[] {
     {
       key: "side",
       header: "Lado",
-      cell: (f) => <ToneBadge tone={f.side === "BUY" ? "sky" : "amber"}>{f.side === "BUY" ? "Compra" : "Venta"}</ToneBadge>,
+      cell: (f) =>
+        f.reason === "settlement" ? (
+          <ToneBadge tone="violet">Liquidación {fmtFixed(f.price, 0)}</ToneBadge>
+        ) : (
+          <ToneBadge tone={f.side === "BUY" ? "sky" : "amber"}>{f.side === "BUY" ? "Compra" : "Venta"}</ToneBadge>
+        ),
     },
     { key: "size", header: "Tamaño", numeric: true, cell: (f) => fmtFixed(f.size, 2) },
     { key: "price", header: "Precio", numeric: true, cell: (f) => fmtPrice(f.price) },
@@ -54,12 +61,17 @@ function fillColumns(tokens: BotMeta["tokens"]): Column<Fill>[] {
 const MAX_ROWS = 200;
 
 /** The latest of the first `count` fills (those visible at the playback time), newest first. */
-export function FillsTable({ fills, count, tokens }: { fills: Fill[]; count: number; tokens: BotMeta["tokens"] }) {
-  const rows = fills.slice(Math.max(0, count - MAX_ROWS), count).reverse();
+export const FillsTable = memo(function FillsTable({ fills, count, tokens }: {
+  fills: Fill[];
+  count: number;
+  tokens: BotMeta["tokens"];
+}) {
+  const rows = useMemo(() => fills.slice(Math.max(0, count - MAX_ROWS), count).reverse(), [fills, count]);
+  const columns = useMemo(() => fillColumns(tokens), [tokens]);
   return (
     <>
       <DataTable
-        columns={fillColumns(tokens)}
+        columns={columns}
         rows={rows}
         rowKey={(f) => `${f.order_id}-${f.ts}-${f.side}`}
         maxHeight={380}
@@ -72,4 +84,4 @@ export function FillsTable({ fills, count, tokens }: { fills: Fill[]; count: num
       )}
     </>
   );
-}
+});

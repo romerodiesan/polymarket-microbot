@@ -1,5 +1,5 @@
 import { lastIndexAtOrBefore } from "@/components/charts/candles";
-import type { BotMeta, FillColumns, LivePayload, SeriesColumns } from "@/lib/data";
+import type { BotMeta, FillColumns, LivePayload, MarketResolution, OrderRow, SeriesColumns } from "@/lib/data";
 
 /** One token's (or one side's) samples as parallel, append-only arrays; NaN where unrecorded. */
 export type Series = {
@@ -45,6 +45,9 @@ export type LiveSnapshot = BotMeta & {
   /** Starts of every market after the first, stable between snapshots unless a market is added. */
   breaks: number[];
   range: { min: number; max: number } | null;
+  /** In submission order. */
+  orders: OrderRow[];
+  resolutions: Record<string, MarketResolution>;
 };
 
 const emptySeries = (): Series => ({ ts: [], bid: [], ask: [], mid: [], spread: [], imbalance: [], score: [], volume: [] });
@@ -99,11 +102,18 @@ export class LiveStore {
   private sides: [Side, Side] | null = null;
   private breaks: number[] = [];
   private startingCash = NaN;
+  private ordersCursor = 0;
+  private orders: OrderRow[] = [];
+  private resolutionsKey = "";
+  private resolutions: Record<string, MarketResolution> = {};
 
   /** Query string asking for what was appended since the last applied payload. */
   query(): string {
     if (!this.version) return "";
-    return `?v=${encodeURIComponent(this.version)}&since=${this.cursor}&fsince=${this.fillsCursor}`;
+    return (
+      `?v=${encodeURIComponent(this.version)}&since=${this.cursor}&fsince=${this.fillsCursor}` +
+      `&osince=${this.ordersCursor}&rkey=${encodeURIComponent(this.resolutionsKey)}`
+    );
   }
 
   /** Applies a payload answering `query()`; returns null if it no longer continues this store. */
@@ -114,7 +124,12 @@ export class LiveStore {
       this.features = new Map();
       this.fills = [];
       this.sides = null;
+      this.orders = [];
     }
+    if (payload.orders.length) this.orders = this.orders.concat(payload.orders);
+    if (payload.resolutions) this.resolutions = payload.resolutions;
+    this.ordersCursor = payload.ordersCursor;
+    this.resolutionsKey = payload.resolutionsKey;
     for (const [token, columns] of Object.entries(payload.features)) {
       let series = this.features.get(token);
       if (!series) {
@@ -167,6 +182,8 @@ export class LiveStore {
       sides: this.sides,
       breaks: this.breaks,
       range: this.range(),
+      orders: this.orders,
+      resolutions: this.resolutions,
     };
   }
 

@@ -1,8 +1,9 @@
 "use client";
 
-import { ArrowLeftRight, ArrowRight, BarChart3, Clock, FileArchive, Gauge, History, Rows3 } from "lucide-react";
+import { ArrowLeftRight, ArrowRight, BarChart3, Clock, FileArchive, Gauge, HardDrive, History, Rows3, Wifi } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useRef, useState } from "react";
+import { changedText, usePoll } from "@/hooks/use-poll";
 import { ChoiceGroup } from "@/components/app/choice-group";
 import { type Column, DataTable } from "@/components/app/data-table";
 import { Signed, StatusDot, ToneBadge, TokenBadge } from "@/components/app/indicators";
@@ -11,7 +12,16 @@ import { EmptyState, Notice, Page, PageHeader, PageSkeleton, Panel } from "@/com
 import { useChartTheme } from "@/components/charts/theme";
 import { type ChartSeries, TimeSeries } from "@/components/charts/time-series";
 import { Button } from "@/components/ui/button";
-import type { CollectionData, FeatureStat, Resolution, Session, TokenSummary } from "@/lib/collection";
+import type {
+  BookDisk,
+  CollectionData,
+  FeatureStat,
+  Resolution,
+  Session,
+  StreamEvent,
+  StreamHealth,
+  TokenSummary,
+} from "@/lib/collection";
 import {
   fmtBytes,
   fmtDateTime,
@@ -214,28 +224,28 @@ export default function CollectionView() {
   const [now, setNow] = useState(0);
   const [resolution, setResolution] = useState<Resolution>("minute");
 
-  useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
+  const previous = useRef<string | null>(null);
+
+  usePoll(
+    async (signal) => {
       try {
-        const res = await fetch("/api/collection", { cache: "no-store" });
-        const json = await res.json();
-        if (cancelled) return;
-        if (!res.ok) throw new Error(json.error ?? res.statusText);
-        setData(json);
+        const res = await fetch("/api/collection", { cache: "no-store", signal });
+        if (!res.ok) {
+          const json = await res.json().catch(() => ({}));
+          throw new Error(json.error ?? res.statusText);
+        }
+        const text = await changedText(res, previous);
+        if (signal.aborted) return;
+        if (text !== null) setData(JSON.parse(text));
         setError(null);
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
+        if (!signal.aborted) setError(e instanceof Error ? e.message : String(e));
       }
-      if (!cancelled) setNow(Date.now() / 1000);
-    };
-    load();
-    const id = setInterval(load, POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
+      if (!signal.aborted) setNow(Date.now() / 1000);
+    },
+    POLL_MS,
+    [],
+  );
 
   if (!data) {
     return (
@@ -382,6 +392,8 @@ export default function CollectionView() {
         </Panel>
       </section>
 
+      <StreamHealthSection stream={data.stream} book={data.book} />
+
       <Panel title="Resumen por token" actions={<ToneBadge>{data.tokens.length}</ToneBadge>}>
         <DataTable columns={tokenColumns} rows={data.tokens} rowKey={(t) => t.token} maxHeight={420} />
       </Panel>
@@ -411,5 +423,141 @@ export default function CollectionView() {
         />
       </Panel>
     </Page>
+  );
+}
+
+const STREAM_KINDS: Record<string, { label: string; tone: "neutral" | "green" | "red" | "sky" | "amber" | "violet" }> = {
+  connect: { label: "Conexión", tone: "green" },
+  disconnect: { label: "Desconexión", tone: "red" },
+  gap: { label: "Hueco", tone: "amber" },
+  resync: { label: "Resync", tone: "sky" },
+  stale_book: { label: "Libro caducado", tone: "amber" },
+  rtt_error: { label: "Error RTT", tone: "red" },
+};
+
+const streamColumns: Column<StreamEvent>[] = [
+  { key: "ts", header: "Hora", cell: (e) => <span className="font-mono tabular-nums">{fmtDateTime(e.ts)}</span> },
+  {
+    key: "kind",
+    header: "Evento",
+    cell: (e) => <ToneBadge tone={STREAM_KINDS[e.kind]?.tone ?? "neutral"}>{STREAM_KINDS[e.kind]?.label ?? e.kind}</ToneBadge>,
+  },
+  {
+    key: "value",
+    header: "Valor",
+    numeric: true,
+    hint: "Huecos: segundos sin eventos del token",
+    cell: (e) => (e.value == null ? "—" : fmtSmart(e.value)),
+  },
+  {
+    key: "detail",
+    header: "Detalle",
+    cell: (e) => <span className="text-xs text-muted-foreground">{e.detail ?? (e.token ? `${e.token.slice(0, 10)}…` : "—")}</span>,
+  },
+];
+
+const fmtHour = (hour: string | null) =>
+  hour ? `${hour.slice(6, 8)}/${hour.slice(4, 6)} ${hour.slice(9, 11)}:00 UTC` : "—";
+
+/** Reconnections, gaps and RTT from `stream_events`; disk used by the raw L2 files. */
+function StreamHealthSection({ stream, book }: { stream: StreamHealth; book: BookDisk }) {
+  const theme = useChartTheme();
+  const count = (kind: string) => stream.counts[kind] ?? 0;
+  const recentDays = book.perDay.slice(-7);
+  const bytesPerDay = recentDays.length ? recentDays.reduce((s, d) => s + d.bytes, 0) / recentDays.length : 0;
+  const rttSeries: ChartSeries[] = stream.rtt.length
+    ? [
+        {
+          id: "rtt",
+          label: "RTT ms",
+          type: "line",
+          color: theme.violet,
+          data: stream.rtt.map((r) => ({ ts: r.ts, value: r.value })),
+        },
+      ]
+    : [];
+
+  return (
+    <>
+      <KpiGrid>
+        <Kpi
+          label="Reconexiones (24 h)"
+          icon={Wifi}
+          value={fmtInt(Math.max(0, count("connect") - 1))}
+          tone={count("disconnect") > 0 ? "down" : undefined}
+          hint={`${fmtInt(count("disconnect"))} desconexiones`}
+        />
+        <Kpi label="Huecos (24 h)" icon={Clock} value={fmtInt(count("gap"))} hint="Sin eventos de un token durante PM_GAP_SECONDS" />
+        <Kpi label="Resyncs (24 h)" icon={History} value={fmtInt(count("resync"))} hint={`${fmtInt(count("stale_book"))} libros caducados`} />
+        <Kpi
+          label="RTT al CLOB"
+          icon={Gauge}
+          value={stream.rttP50 == null ? "—" : `${fmtInt(stream.rttP50)} ms`}
+          hint={stream.rttP95 == null ? "sin mediciones en 24 h" : `p50 · p95 ${fmtInt(stream.rttP95)} ms`}
+        />
+        <Kpi
+          label="Libro L2 en disco"
+          icon={HardDrive}
+          value={fmtBytes(book.bytes)}
+          hint={`${fmtInt(book.files)} archivos · ${fmtInt(book.rows)} eventos`}
+        />
+        <Kpi
+          label="L2 por día"
+          icon={HardDrive}
+          value={recentDays.length ? fmtBytes(bytesPerDay) : "—"}
+          hint={
+            book.retentionDays > 0
+              ? `retención ${book.retentionDays} d ≈ ${fmtBytes(bytesPerDay * book.retentionDays)}`
+              : "retención: sin límite"
+          }
+        />
+      </KpiGrid>
+
+      <section className="grid gap-4 md:gap-6 lg:grid-cols-3">
+        <Panel className="lg:col-span-2" title="Latencia al CLOB" description="RTT de GET /time desde la máquina del bot, últimas 24 h">
+          {rttSeries.length ? (
+            <TimeSeries className="h-[200px] md:h-[240px]" precision={0} series={rttSeries} />
+          ) : (
+            <EmptyState icon={Gauge} title="Sin mediciones">
+              El bot mide la RTT cada PM_RTT_INTERVAL_SECONDS mientras está en marcha.
+            </EmptyState>
+          )}
+        </Panel>
+        <Panel
+          title="Libro L2 por día"
+          description={`${book.directory} · ${fmtHour(book.firstHour)} – ${fmtHour(book.lastHour)} (${fmtInt(book.hours)} h)`}
+        >
+          {book.perDay.length ? (
+            <ul className="flex flex-col divide-y text-sm">
+              {book.perDay
+                .slice(-10)
+                .reverse()
+                .map((d) => (
+                  <li key={d.day} className="flex items-center justify-between gap-3 py-1.5 first:pt-0 last:pb-0">
+                    <span className="font-mono text-[13px]">{`${d.day.slice(6, 8)}/${d.day.slice(4, 6)}/${d.day.slice(0, 4)}`}</span>
+                    <span className="font-mono text-xs tabular-nums text-muted-foreground">
+                      {fmtInt(d.rows)} eventos · {fmtBytes(d.bytes)}
+                    </span>
+                  </li>
+                ))}
+            </ul>
+          ) : (
+            <EmptyState icon={HardDrive} title="Sin libro grabado">
+              Activa PM_RECORD_BOOK_EVENTS para guardar el L2 crudo.
+            </EmptyState>
+          )}
+        </Panel>
+      </section>
+
+      <Panel title="Eventos del stream" description="Conexiones, huecos, resyncs y errores más recientes">
+        <DataTable
+          columns={streamColumns}
+          rows={stream.recent}
+          rowKey={(e, i) => `${e.ts}-${e.kind}-${i}`}
+          maxHeight={320}
+          empty="Sin eventos registrados (datos anteriores al registro del stream)."
+        />
+      </Panel>
+    </>
   );
 }

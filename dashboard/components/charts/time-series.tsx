@@ -35,7 +35,8 @@ export type TimePoint = { ts: number; value: number; color?: string };
 export type ChartMarker = {
   ts: number;
   price: number;
-  kind: "buy" | "sell";
+  /** `settle`: a position paid out at the market's resolution (0 or 1). */
+  kind: "buy" | "sell" | "settle";
   text?: string;
 };
 
@@ -111,6 +112,16 @@ function toMarkers(markers: ChartMarker[], times: UTCTimestamp[], T: ChartTheme)
       }
       const time = lo > 0 && Math.abs(times[lo - 1] - m.ts) < Math.abs(times[lo] - m.ts) ? times[lo - 1] : times[lo];
       const buy = m.kind === "buy";
+      if (m.kind === "settle") {
+        // Pinned above the bar: the payout (0 or 1) would otherwise stretch the price scale.
+        return {
+          time,
+          position: "aboveBar",
+          shape: "square",
+          color: T.violet,
+          text: m.text,
+        } satisfies SeriesMarker<Time>;
+      }
       return {
         time,
         price: m.price,

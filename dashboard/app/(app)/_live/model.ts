@@ -130,18 +130,35 @@ export function maxDrawdownAt(curve: EquityCurve, t: number) {
   return i >= 0 ? curve.worst[i] : 0;
 }
 
+const feeSums = new WeakMap<Fill[], number[]>();
+
+/** Fees paid by the first `count` fills, from prefix sums built once per fills array. */
+export function feesUpTo(fills: Fill[], count: number): number {
+  let sums = feeSums.get(fills);
+  if (!sums) {
+    sums = [0];
+    for (const f of fills) sums.push(sums[sums.length - 1] + (f.fee || 0));
+    feeSums.set(fills, sums);
+  }
+  return sums[Math.min(count, fills.length)];
+}
+
 const markerCache = new WeakMap<Fill[], ChartMarker[]>();
 
 /** Chart markers for `fills`, built once per fills array; slice to the visible count. */
 export function fillMarkers(fills: Fill[]): ChartMarker[] {
   let markers = markerCache.get(fills);
   if (!markers) {
-    markers = fills.map((f) => ({
-      ts: f.ts,
-      price: f.price,
-      kind: f.side === "BUY" ? "buy" : "sell",
-      text: `${f.side === "BUY" ? "C" : "V"} ${fmtFixed(f.size, 1)}`,
-    }));
+    markers = fills.map((f) =>
+      f.reason === "settlement"
+        ? { ts: f.ts, price: f.price, kind: "settle", text: `Liq. ${fmtFixed(f.price, 0)}` }
+        : {
+            ts: f.ts,
+            price: f.price,
+            kind: f.side === "BUY" ? "buy" : "sell",
+            text: `${f.side === "BUY" ? "C" : "V"} ${fmtFixed(f.size, 1)}`,
+          },
+    );
     markerCache.set(fills, markers);
   }
   return markers;

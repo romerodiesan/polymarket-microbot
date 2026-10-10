@@ -4,7 +4,10 @@ import { hasSession, unauthorizedResponse } from "@/lib/session";
 
 const cursor = (value: string | null) => (value === null || value === "" ? undefined : Number(value));
 
-/** `?v=<version>&since=<rows>&fsince=<fills>` returns only what was appended since; 304 if nothing. */
+/**
+ * `?v=<version>&since=<rows>&fsince=<fills>&osince=<orders>&rkey=<markets key>` returns only what
+ * was appended or changed since; 304 if nothing.
+ */
 export async function GET(request: NextRequest) {
   if (!(await hasSession())) return unauthorizedResponse();
   await connection();
@@ -14,6 +17,8 @@ export async function GET(request: NextRequest) {
       version: params.get("v"),
       since: cursor(params.get("since")),
       fillsSince: cursor(params.get("fsince")),
+      ordersSince: cursor(params.get("osince")),
+      resolutionsKey: params.get("rkey"),
     });
     if (!payload) return new Response(null, { status: 304 });
     return Response.json(payload);

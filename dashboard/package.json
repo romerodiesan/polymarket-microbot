@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:store": "node scripts/run.mjs scripts/test-store.ts",
+    "test:book": "node scripts/run.mjs scripts/test-book.ts",
     "bench:data": "node scripts/run.mjs scripts/bench-data.ts"
   },
   "dependencies": {
@@ -15,6 +16,7 @@
     "clsx": "^2.1.1",
     "cn": "^0.4.0",
     "hyparquet": "^1.31.3",
+    "hyparquet-compressors": "^1.1.2",
     "lightweight-charts": "^5.2.1",
     "lucide-react": "^1.53.0",
     "next": "16.4.0",

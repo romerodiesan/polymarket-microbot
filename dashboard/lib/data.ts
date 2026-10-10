@@ -10,6 +10,7 @@ import {
   featureStore,
   fillsStore,
   lastAtOrBefore,
+  readTable,
 } from "./store";
 
 export { ROOT, readEnvFile };
@@ -49,6 +50,59 @@ export type FillColumns = {
   outcome: (string | null)[];
 };
 
+export const ORDER_COLUMNS = [
+  "order_id", "market", "token_id", "outcome", "side", "reason", "status", "reject_reason",
+  "submit_ts", "done_ts", "latency_ms", "requested_size", "limit_price", "filled_size", "avg_price",
+  "fee", "fee_rate", "fee_source", "slippage_vs_mid", "slippage_vs_touch", "decision_mid", "exec_mid",
+] as const;
+
+/** One order intent and how it executed (`orders` table); null where not recorded. */
+export type OrderRow = {
+  order_id: string;
+  market: string | null;
+  token_id: string;
+  outcome: string | null;
+  side: string;
+  reason: string | null;
+  status: string | null;
+  reject_reason: string | null;
+  submit_ts: number;
+  done_ts: number | null;
+  latency_ms: number | null;
+  requested_size: number | null;
+  limit_price: number | null;
+  filled_size: number | null;
+  avg_price: number | null;
+  fee: number | null;
+  fee_rate: number | null;
+  fee_source: string | null;
+  slippage_vs_mid: number | null;
+  slippage_vs_touch: number | null;
+  decision_mid: number | null;
+  exec_mid: number | null;
+};
+
+const MARKET_COLUMNS = [
+  "slug", "resolved", "winner", "payout_yes", "payout_no", "resolved_ts", "btc_open", "btc_close",
+  "btc_source", "fee_rate", "fee_source", "end_ts",
+] as const;
+
+/** Official outcome and costs of a market (`markets` table). */
+export type MarketResolution = {
+  slug: string;
+  resolved: boolean;
+  winner: string | null;
+  payoutYes: number | null;
+  payoutNo: number | null;
+  resolvedTs: number | null;
+  btcOpen: number | null;
+  btcClose: number | null;
+  btcSource: string | null;
+  feeRate: number | null;
+  feeSource: string | null;
+  endTs: number | null;
+};
+
 /** One market of a rolling series, as recorded (start/end are the first and last rows). */
 export type MarketSpan = { slug: string; yes: string; no: string; start: number; end: number };
 
@@ -78,9 +132,21 @@ export type LivePayload = BotMeta & {
   fillsCursor: number;
   features: Record<string, SeriesColumns>;
   fills: FillColumns;
+  ordersCursor: number;
+  /** Orders appended since the client's cursor (all of them on a reset). */
+  orders: OrderRow[];
+  resolutionsKey: string;
+  /** Every market's resolution, or null when unchanged since the client's key. */
+  resolutions: Record<string, MarketResolution> | null;
 };
 
-export type LiveRequest = { version?: string | null; since?: number; fillsSince?: number };
+export type LiveRequest = {
+  version?: string | null;
+  since?: number;
+  fillsSince?: number;
+  ordersSince?: number;
+  resolutionsKey?: string | null;
+};
 
 /** Failed lookups are retried after this long instead of on every poll. */
 const LOOKUP_RETRY_MS = 60_000;
@@ -122,8 +188,10 @@ export function activeTokens(env: Record<string, string>, store: FeatureStore, i
 export function parquetPaths(env: Record<string, string>) {
   const parquetDir = path.resolve(/*turbopackIgnore: true*/ ROOT, env.PM_PARQUET_DIR || "data/parquet");
   return {
+    parquetDir,
     featuresFile: path.join(parquetDir, "features.parquet"),
     fillsFile: path.join(parquetDir, "fills.parquet"),
+    table: (name: string) => path.join(parquetDir, `${name}.parquet`),
   };
 }
 
@@ -233,18 +301,89 @@ function newFeatures(store: FeatureStore, from: number): Record<string, SeriesCo
   return features;
 }
 
+const str = (v: unknown) => (v == null ? null : String(v));
+const numOrNull = (v: unknown) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+
+export async function loadOrders(env: Record<string, string>): Promise<OrderRow[]> {
+  const rows = await readTable(parquetPaths(env).table("orders"), ORDER_COLUMNS);
+  return rows.map((r) => ({
+    order_id: String(r.order_id ?? ""),
+    market: str(r.market),
+    token_id: String(r.token_id ?? ""),
+    outcome: str(r.outcome),
+    side: String(r.side ?? ""),
+    reason: str(r.reason),
+    status: str(r.status),
+    reject_reason: str(r.reject_reason),
+    submit_ts: Number(r.submit_ts ?? 0),
+    done_ts: numOrNull(r.done_ts),
+    latency_ms: numOrNull(r.latency_ms),
+    requested_size: numOrNull(r.requested_size),
+    limit_price: numOrNull(r.limit_price),
+    filled_size: numOrNull(r.filled_size),
+    avg_price: numOrNull(r.avg_price),
+    fee: numOrNull(r.fee),
+    fee_rate: numOrNull(r.fee_rate),
+    fee_source: str(r.fee_source),
+    slippage_vs_mid: numOrNull(r.slippage_vs_mid),
+    slippage_vs_touch: numOrNull(r.slippage_vs_touch),
+    decision_mid: numOrNull(r.decision_mid),
+    exec_mid: numOrNull(r.exec_mid),
+  }));
+}
+
+export async function loadResolutions(env: Record<string, string>) {
+  const file = parquetPaths(env).table("markets");
+  const rows = await readTable(file, MARKET_COLUMNS);
+  const key = existsSync(file) ? String(statSync(file).mtimeMs) : "";
+  const resolutions: Record<string, MarketResolution> = {};
+  for (const r of rows) {
+    if (!r.slug) continue;
+    resolutions[String(r.slug)] = {
+      slug: String(r.slug),
+      resolved: Boolean(r.resolved),
+      winner: str(r.winner),
+      payoutYes: numOrNull(r.payout_yes),
+      payoutNo: numOrNull(r.payout_no),
+      resolvedTs: numOrNull(r.resolved_ts),
+      btcOpen: numOrNull(r.btc_open),
+      btcClose: numOrNull(r.btc_close),
+      btcSource: str(r.btc_source),
+      feeRate: numOrNull(r.fee_rate),
+      feeSource: str(r.fee_source),
+      endTs: numOrNull(r.end_ts),
+    };
+  }
+  return { key, resolutions };
+}
+
 /** `null` when nothing changed since the client's cursors (the route answers 304). */
 export async function loadLiveData(request: LiveRequest = {}): Promise<LivePayload | null> {
   const env = readEnvFile();
   const { featuresFile, fillsFile } = parquetPaths(env);
-  const [store, fills] = await Promise.all([featureStore(featuresFile), fillsStore(fillsFile)]);
+  const [store, fills, orders, markets] = await Promise.all([
+    featureStore(featuresFile),
+    fillsStore(fillsFile),
+    loadOrders(env),
+    loadResolutions(env),
+  ]);
   const index = featureIndex(store);
   const version = `${store.version}~${fills.version}`;
   const since = request.since ?? -1;
   const fillsSince = request.fillsSince ?? -1;
+  const ordersSince = request.ordersSince ?? -1;
   const reset =
-    request.version !== version || since < 0 || since > store.count || fillsSince < 0 || fillsSince > fills.count;
-  if (!reset && since === store.count && fillsSince === fills.count) return null;
+    request.version !== version ||
+    since < 0 ||
+    since > store.count ||
+    fillsSince < 0 ||
+    fillsSince > fills.count ||
+    ordersSince < 0 ||
+    ordersSince > orders.length;
+  const resolutionsChanged = request.resolutionsKey !== markets.key;
+  if (!reset && since === store.count && fillsSince === fills.count && ordersSince === orders.length && !resolutionsChanged) {
+    return null;
+  }
 
   const tokens = activeTokens(env, store, index);
   const name = (code: number) => (code < 0 ? "" : store.dict.token_id[code]);
@@ -272,5 +411,9 @@ export async function loadLiveData(request: LiveRequest = {}): Promise<LivePaylo
     })),
     features: reset ? allFeatures(store, index) : newFeatures(store, since),
     fills: fillColumns(fills, reset ? 0 : fillsSince),
+    ordersCursor: orders.length,
+    orders: orders.slice(reset ? 0 : ordersSince),
+    resolutionsKey: markets.key,
+    resolutions: reset || resolutionsChanged ? markets.resolutions : null,
   };
 }

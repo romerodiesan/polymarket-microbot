@@ -1,7 +1,20 @@
 "use client";
 
-import { Activity, ArrowLeftRight, Banknote, ExternalLink, Layers, TrendingDown, TrendingUp, Wallet } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import {
+  Activity,
+  ArrowLeftRight,
+  Banknote,
+  CheckCheck,
+  ExternalLink,
+  Layers,
+  Receipt,
+  Ruler,
+  TrendingDown,
+  TrendingUp,
+  Wallet,
+} from "lucide-react";
+import { useMemo, useState } from "react";
+import { usePoll } from "@/hooks/use-poll";
 import { ToneBadge } from "@/components/app/indicators";
 import { Kpi, KpiGrid } from "@/components/app/kpi";
 import { EmptyState, Notice, Page, PageHeader, PageSkeleton, Panel } from "@/components/app/page";
@@ -10,11 +23,14 @@ import { ChartGroup } from "@/components/charts/chart-group";
 import type { Separator } from "@/components/charts/separators";
 import { useChartTheme } from "@/components/charts/theme";
 import { type ChartSeries, TimeSeries } from "@/components/charts/time-series";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { LivePayload } from "@/lib/data";
 import { fmtInt, fmtFixed, fmtTime, fmtUsd } from "@/lib/format";
+import { BookPanel } from "./book-panel";
 import { FillsTable } from "./fills-table";
+import { OrdersTable, executionStats, ordersAt } from "./orders-table";
 import { LiveStore, type LiveSnapshot } from "./live-store";
-import { equityCurve, maxDrawdownAt, portfolioAt } from "./model";
+import { equityCurve, feesUpTo, maxDrawdownAt, portfolioAt } from "./model";
 import { PriceChart } from "./price-chart";
 import { ChartViewBar, useChartView } from "./controls/chart-view";
 import { LiveControls } from "./controls/live-controls";
@@ -30,37 +46,26 @@ export default function Dashboard() {
   const [data, setData] = useState<LiveSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    let busy = false;
-    const load = async () => {
-      if (busy) return;
-      busy = true;
+  usePoll(
+    async (signal) => {
       try {
         const query = store.query();
-        const res = await fetch(`/api/data${query}`, { cache: "no-store" });
-        if (cancelled) return;
+        const res = await fetch(`/api/data${query}`, { cache: "no-store", signal });
         if (res.status !== 304) {
           const json = await res.json();
-          if (cancelled) return;
+          if (signal.aborted) return;
           if (!res.ok) throw new Error(json.error ?? res.statusText);
           const snapshot = store.apply(json as LivePayload, query);
           if (snapshot) setData(snapshot);
         }
         setError(null);
       } catch (e) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        busy = false;
+        if (!signal.aborted) setError(e instanceof Error ? e.message : String(e));
       }
-    };
-    load();
-    const id = setInterval(load, POLL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [store]);
+    },
+    POLL_MS,
+    [store],
+  );
 
   const range = data?.range ?? null;
   const controls = useLiveControls(range);
@@ -71,9 +76,17 @@ export default function Dashboard() {
   const curve = useMemo(() => (data ? equityCurve(data) : null), [data]);
   const marketStarts = useMemo(() => data?.markets.map((m) => m.start) ?? [], [data]);
   const separators = useMemo<Separator[]>(
-    () => data?.markets.map((m) => ({ ts: m.start, label: fmtTime(m.start).slice(0, 5) })) ?? [],
+    () =>
+      data?.markets.map((m) => {
+        const winner = data.resolutions[m.slug]?.winner;
+        const mark = winner === "YES" ? " ▲ YES" : winner === "NO" ? " ▼ NO" : "";
+        return { ts: m.start, label: `${fmtTime(m.start).slice(0, 5)}${mark}` };
+      }) ?? [],
     [data],
   );
+
+  const viewedMarket = data?.markets.filter((m) => m.start <= t).at(-1) ?? data?.markets.at(-1);
+  const resolution = viewedMarket ? data?.resolutions[viewedMarket.slug] : undefined;
 
   const header = (
     <PageHeader
@@ -96,6 +109,18 @@ export default function Dashboard() {
         ) : undefined
       }
     >
+      {resolution?.winner ? (
+        <ToneBadge
+          tone={resolution.winner === "YES" ? "green" : "red"}
+          className="py-1"
+        >
+          Resolvió {resolution.winner}
+          {resolution.btcOpen != null && resolution.btcClose != null &&
+            ` · BTC ${fmtFixed(resolution.btcOpen, 0)} → ${fmtFixed(resolution.btcClose, 0)}`}
+        </ToneBadge>
+      ) : resolution?.endTs && resolution.endTs < (data?.range?.max ?? 0) ? (
+        <ToneBadge tone="amber" className="py-1">Pendiente de resolución</ToneBadge>
+      ) : null}
       {data && <ToneBadge>{fmtInt(data.totalFeatureRows)} filas</ToneBadge>}
     </PageHeader>
   );
@@ -124,6 +149,9 @@ export default function Dashboard() {
   const threshold = data.config.signalThreshold;
   const maxDrawdown = maxDrawdownAt(curve, t);
   const currentMarketStart = data.markets.at(-1)?.start ?? range.min;
+  const fees = feesUpTo(data.fills, portfolio.fills);
+  const orderCount = ordersAt(data.orders, t);
+  const execution = executionStats(data.orders, orderCount);
   const yesPosition = portfolio.positions[data.tokens.yes] ?? 0;
   const noPosition = portfolio.positions[data.tokens.no] ?? 0;
 
@@ -192,6 +220,32 @@ export default function Dashboard() {
           hint="YES / NO"
         />
         <Kpi label="Fills" icon={ArrowLeftRight} value={fmtInt(portfolio.fills)} />
+        <Kpi
+          label="Comisiones"
+          icon={Receipt}
+          value={fmtUsd(fees)}
+          hint={portfolio.pnl ? `${fmtFixed((fees / Math.abs(portfolio.pnl)) * 100, 0)}% del |PnL|` : undefined}
+        />
+        <Kpi
+          label="Tasa de fill"
+          icon={CheckCheck}
+          value={execution.fillRate == null ? "—" : `${fmtFixed(execution.fillRate * 100, 0)}%`}
+          hint={
+            execution.orders
+              ? `${fmtInt(execution.orders)} órdenes · ${fmtFixed((execution.rejectRate ?? 0) * 100, 0)}% rechazadas`
+              : "sin órdenes registradas"
+          }
+        />
+        <Kpi
+          label="Slippage vs touch"
+          icon={Ruler}
+          value={execution.slippageVsTouch == null ? "—" : fmtFixed(execution.slippageVsTouch, 4)}
+          hint={
+            execution.latencyP50 == null
+              ? undefined
+              : `latencia p50 ${fmtInt(execution.latencyP50)} ms · p95 ${fmtInt(execution.latencyP95 ?? NaN)} ms`
+          }
+        />
       </KpiGrid>
 
       <ChartGroup edge={t}>
@@ -238,9 +292,31 @@ export default function Dashboard() {
         </section>
       </ChartGroup>
 
-      <Panel title="Fills" actions={<ToneBadge>{fmtInt(portfolio.fills)}</ToneBadge>}>
-        <FillsTable fills={data.fills} count={portfolio.fills} tokens={data.tokens} />
-      </Panel>
+      <BookPanel t={t} live={live} markets={data.markets} tokens={data.tokens} fills={data.fills} theme={theme} />
+
+      <Tabs defaultValue="fills" className="gap-3">
+        <TabsList>
+          <TabsTrigger value="fills">
+            Fills <span className="font-mono text-xs text-muted-foreground">{fmtInt(portfolio.fills)}</span>
+          </TabsTrigger>
+          <TabsTrigger value="orders">
+            Órdenes <span className="font-mono text-xs text-muted-foreground">{fmtInt(orderCount)}</span>
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="fills">
+          <Panel title="Fills" description="Ejecuciones y liquidaciones 0/1 al resolverse cada mercado">
+            <FillsTable fills={data.fills} count={portfolio.fills} tokens={data.tokens} />
+          </Panel>
+        </TabsContent>
+        <TabsContent value="orders">
+          <Panel
+            title="Órdenes"
+            description="Cada intención del bot con su estado, precio al decidir frente al ejecutado, latencia y comisión"
+          >
+            <OrdersTable orders={data.orders} count={orderCount} tokens={data.tokens} />
+          </Panel>
+        </TabsContent>
+      </Tabs>
     </Page>
   );
 }

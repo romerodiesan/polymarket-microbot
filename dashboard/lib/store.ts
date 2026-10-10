@@ -225,6 +225,61 @@ export async function fillsStore(file: string): Promise<FillsStore> {
   return store;
 }
 
+export type TableRow = Record<string, string | number | boolean | null>;
+
+const tables = new Map<string, { key: string; rows: TableRow[] }>();
+
+const plain = (v: unknown): string | number | boolean | null =>
+  v == null
+    ? null
+    : typeof v === "bigint"
+      ? Number(v)
+      : v instanceof Date
+        ? v.getTime() / 1000
+        : typeof v === "number" || typeof v === "boolean" || typeof v === "string"
+          ? v
+          : String(v);
+
+/**
+ * A whole small Parquet table as row objects, re-read only when the file changes. Missing files
+ * give no rows and missing columns read as null, so exports from older bots still load.
+ */
+export async function readTable(file: string, columns: readonly string[]): Promise<TableRow[]> {
+  const info = await stat(file).catch(() => null);
+  if (!info) return [];
+  const key = `${info.mtimeMs}:${info.size}:${columns.join(",")}`;
+  const cached = tables.get(file);
+  if (cached?.key === key) return cached.rows;
+  const handle = await open(file, "r");
+  try {
+    const { size } = await handle.stat();
+    const buffer = handleBuffer(handle, size);
+    const metadata = await parquetMetadataAsync(buffer);
+    const present = new Set(metadata.schema.map((s) => s.name));
+    const wanted = columns.filter((c) => present.has(c));
+    const count = Number(metadata.num_rows);
+    const rows: TableRow[] = Array.from({ length: count }, () => {
+      const row: TableRow = {};
+      for (const c of columns) row[c] = null;
+      return row;
+    });
+    if (wanted.length && count) {
+      await parquetRead({
+        file: buffer,
+        metadata,
+        columns: wanted,
+        onChunk: ({ columnName, columnData, rowStart, rowEnd }) => {
+          for (let i = rowStart; i < rowEnd; i++) rows[i][columnName] = plain(columnData[i - rowStart]);
+        },
+      });
+    }
+    tables.set(file, { key, rows });
+    return rows;
+  } finally {
+    await handle.close();
+  }
+}
+
 /** Growable list of row indices. */
 export class RowList {
   rows = new Int32Array(64);
