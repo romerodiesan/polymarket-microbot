@@ -29,9 +29,30 @@ class Settings(BaseSettings):
     cooldown_seconds: float = Field(3.0, ge=0)
     stale_book_seconds: float = Field(5.0, gt=0)
     paper_starting_cash: float = Field(1_000.0, gt=0)
-    fee_rate: float = Field(0.0, ge=0)
+    # Taker fee = size * fee_rate * p * (1 - p); 0.07 is Polymarket's published crypto rate.
+    # Used when the CLOB fee-rate lookup fails; a market whose base_fee is 0 is fee-free.
+    fee_rate: float = Field(0.07, ge=0)
     model_path: Path | None = None
     export_interval_seconds: float = Field(5.0, ge=0)
+
+    # Paper execution realism. Latency None uses the measured REST round trip to the CLOB.
+    paper_latency_ms: float | None = Field(None, ge=0)
+    paper_extra_slippage_ticks: float = Field(0.0, ge=0)
+    # Fraction of each visible level the simulator may take (others race for the same liquidity).
+    paper_fill_haircut: float = Field(1.0, gt=0, le=1)
+
+    # Raw L2 recording and stream health
+    record_book_events: bool = True
+    book_retention_days: float = Field(14.0, ge=0)
+    book_flush_seconds: float = Field(60.0, gt=0)
+    # Current top levels for the dashboard; 0 disables the file.
+    book_state_seconds: float = Field(1.0, ge=0)
+    book_state_path: Path = Path("data/bot/book.json")
+    book_state_depth: int = Field(20, ge=1)
+    gap_seconds: float = Field(5.0, gt=0)
+    rtt_interval_seconds: float = Field(60.0, gt=0)
+    snapshot_interval_seconds: float = Field(5.0, gt=0)
+    resolver_interval_seconds: float = Field(60.0, gt=0)
 
     # Signal construction
     signal_half_life_seconds: float = Field(5.0, gt=0)

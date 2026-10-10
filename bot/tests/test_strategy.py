@@ -87,3 +87,31 @@ def test_rejects_extreme_prices_and_high_volatility():
     strategy = MicrostructureStrategy(settings())
     assert strategy.decide(market(0.9, yes_mid=0.97), {}, now=100) == []
     assert strategy.decide(market(0.9, volatility=0.2), {}, now=100) == []
+
+
+@pytest.mark.parametrize(
+    ("signal", "overrides", "action", "reason"),
+    [
+        (0.23, {}, "skip", "below_threshold"),
+        (0.9, {"volatility": 0.2}, "skip", "volatility"),
+        (0.9, {"spread": 0.5}, "skip", "spread"),
+        (0.9, {}, "enter", "entry"),
+    ],
+)
+def test_last_decision_explains_the_filter(signal, overrides, action, reason):
+    strategy = MicrostructureStrategy(settings())
+    strategy.decide(market(signal, **overrides), {}, now=100)
+    decision = strategy.last_decision
+    assert (decision.action, decision.reason, decision.token_id) == (action, reason, "yes")
+    assert decision.threshold == pytest.approx(0.2 + 0.02 * 2)
+    assert (decision.intended_size > 0) == (action == "enter")
+
+
+def test_last_decision_reports_hold_and_exit():
+    strategy = MicrostructureStrategy(settings())
+    held = {"yes": Position(size=4, avg_price=0.51, opened_at=1000)}
+    strategy.decide(market(0.01), held, now=1005)
+    assert (strategy.last_decision.action, strategy.last_decision.reason) == ("hold", "position_open")
+    strategy.decide(market(-0.6), held, now=1005)
+    assert strategy.last_decision.action == "exit"
+    assert strategy.last_decision.intended_size == 4

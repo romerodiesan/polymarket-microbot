@@ -20,6 +20,12 @@ class PositionBook:
     def __init__(self) -> None:
         self.positions: dict[str, Position] = {}
         self.realized_pnl = 0.0
+        self.fees_paid = 0.0
+        # Largest cost basis held at once across all tokens.
+        self.max_committed = 0.0
+
+    def committed(self) -> float:
+        return sum(p.size * p.avg_price for p in self.positions.values() if p.open)
 
     def get(self, token_id: str) -> Position:
         return self.positions.get(token_id, Position())
@@ -31,12 +37,14 @@ class PositionBook:
               ts: float) -> float:
         """Record a fill and return the PnL it realizes (0 for buys)."""
         pos = self.positions.setdefault(token_id, Position())
+        self.fees_paid += fee
         if side == "BUY":
             if not pos.open:
                 pos.opened_at = ts
             cost = pos.avg_price * pos.size + price * size + fee
             pos.size += size
             pos.avg_price = cost / pos.size
+            self.max_committed = max(self.max_committed, self.committed())
             return 0.0
         size = min(size, pos.size)
         pnl = (price - pos.avg_price) * size - fee

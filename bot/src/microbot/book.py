@@ -93,18 +93,22 @@ class OrderBook:
         data = self.bids if side == "bid" else self.asks
         return data[prices[0]] if prices else 0.0
 
-    def walk(self, side: str, size: float, limit: float) -> tuple[float, float]:
+    def walk(self, side: str, size: float, limit: float, haircut: float = 1.0,
+             shift: float = 0.0) -> tuple[float, float]:
         """Simulate a taker order of `size` for side "BUY"/"SELL" up to `limit`.
 
-        Returns (filled_size, average_price); average_price is 0 when nothing fills.
+        Only `haircut` of each level is available and every level trades `shift` worse (both
+        model competition for the same liquidity). Returns (filled_size, average_price);
+        average_price is 0 when nothing fills.
         """
         buying = side.upper() == "BUY"
         book_side, data = ("ask", self.asks) if buying else ("bid", self.bids)
         remaining, notional = size, 0.0
-        for price in self.prices(book_side):
+        for level in self.prices(book_side):
+            price = level + shift if buying else level - shift
             if (buying and price > limit) or (not buying and price < limit) or remaining <= 0:
                 break
-            take = min(remaining, data[price])
+            take = min(remaining, data[level] * haircut)
             remaining -= take
             notional += take * price
         filled = size - remaining
