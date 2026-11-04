@@ -57,6 +57,7 @@ class Ledger:
                 "outcome": tag.get("outcome"), "size": pos.size, "avg_price": pos.avg_price,
                 "mark_mid": mark.mid, "mark_bid": mark.bid, "unrealized": pos.size * mid - cost,
                 "opened_at": pos.opened_at,
+                "entry_fees": pos.entry_fees,
             })
         equity = self.cash + value_mid
         self.peak = max(self.peak, equity)

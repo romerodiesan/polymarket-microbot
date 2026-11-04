@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Event
 
 import duckdb
 
@@ -114,3 +116,49 @@ def test_partitioned_writer_only_flushes_on_interval_and_prunes(tmp_path):
     writer.append(book_row(HOUR + 3 * 86400, 2))
     writer.flush(now=HOUR + 3 * 86400)
     assert PartitionedWriter(directory, BOOK_EVENT_COLUMNS, "recv_ts").sequence > writer.sequence - 1
+
+
+def test_rows_arriving_during_dataframe_conversion_are_not_lost(tmp_path, monkeypatch):
+    from microbot import storage as module
+
+    writer = PartitionedWriter(tmp_path, BOOK_EVENT_COLUMNS, "recv_ts")
+    writer.append(book_row(HOUR + 1, 1))
+    dataframe = module.pd.DataFrame
+    injected = False
+
+    def interleaved_frame(*args, **kwargs):
+        nonlocal injected
+        frame = dataframe(*args, **kwargs)
+        if not injected:
+            injected = True
+            writer.append(book_row(HOUR + 2, 2))
+        return frame
+
+    monkeypatch.setattr(module.pd, "DataFrame", interleaved_frame)
+    writer.flush(now=HOUR + 10)
+    monkeypatch.setattr(module.pd, "DataFrame", dataframe)
+    writer.flush(now=HOUR + 20)
+    assert read(tmp_path) == [(1,), (2,)]
+
+
+def test_export_can_read_while_ingestion_writes(tmp_path):
+    storage = Storage(tmp_path / "bot.duckdb", tmp_path / "parquet")
+    started = Event()
+
+    def export():
+        started.set()
+        for _ in range(3):
+            storage.export_parquet()
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(export)
+        assert started.wait(timeout=2)
+        for i in range(100):
+            storage.insert("features", {"ts": float(i), "token_id": "yes"})
+        future.result(timeout=10)
+    storage.close()
+    con = duckdb.connect()
+    count = con.execute("SELECT count(*) FROM read_parquet(?)",
+                        [str(tmp_path / "parquet/features.parquet")]).fetchone()[0]
+    con.close()
+    assert count == 100

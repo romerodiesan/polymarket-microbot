@@ -402,6 +402,11 @@ def get_paper_performance(lookback_hours: float = 168, run_id: str | None = None
                 "totals": empty_totals}
 
     cutoff = time() - lookback_hours * 3600
+    run_count = query(
+        f"SELECT count(DISTINCT coalesce(run_id, 'legacy')) AS n FROM {fills} "
+        "WHERE ts >= ? AND mode = 'paper'", [cutoff],
+    )[0]["n"] if "run_id" in columns(fills) else 1
+    scope["run_count"] = run_count
     features = parquet_relation("features") if parquet_files("features") else None
     marks = (
         f"SELECT token_id, arg_max(midpoint, ts) AS mark_price, max(ts) AS mark_ts "
@@ -488,13 +493,16 @@ def get_paper_performance(lookback_hours: float = 168, run_id: str | None = None
             "marked_pnl": marked,
             "net_pnl": settled + marked,
             "max_capital_committed": committed,
-            "roi_on_max_committed": (settled + marked) / committed if committed else None,
+            "roi_on_max_committed": ((settled + marked) / committed
+                                     if committed and run_count == 1 else None),
         },
         "methodology": (
             "Per token: cash flow minus fees plus the open position valued at the official 0/1 "
             "payout when its market is resolved (settled_pnl) or at its latest midpoint "
             "otherwise (marked_pnl, provisional). realized_pnl sums fills.pnl as recorded. "
-            "ROI uses the peak cost basis held at once (equity.max_simultaneous_exposure)."
+            "ROI uses the peak cost basis held at once (equity.max_simultaneous_exposure), "
+            "only for a single run; aggregating restarted portfolios has no shared denominator. "
+            "A lookback that cuts through a position is not a reconciled account-period return."
         ),
     }
 

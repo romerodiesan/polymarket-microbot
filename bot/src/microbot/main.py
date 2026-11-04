@@ -21,6 +21,7 @@ from .ledger import Ledger, Mark
 from .markets import Market, fetch_fee_rate_bps, find_series_market
 from .model import ModelPredictor, features_version
 from .resolver import Resolver
+from .risk import EntryRisk, day_start
 from .storage import BOOK_EVENT_COLUMNS, PartitionedWriter, Storage
 from .strategy import MIN_LIMIT_PRICE, Intent, MicrostructureStrategy
 from .ws import MarketStream
@@ -147,8 +148,27 @@ def _num(value) -> float | None:
         return None
 
 
+async def finish_in_thread(function) -> None:
+    """Keep ingestion responsive and let in-progress I/O finish before closing its resources."""
+    task = asyncio.create_task(asyncio.to_thread(function))
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+def check_execution_halt(settings: Settings) -> None:
+    if settings.mode == "live" and settings.execution_halt_path.exists():
+        raise RuntimeError(
+            f"Live execution is halted ({settings.execution_halt_path}). Reconcile venue orders, "
+            "fills and balances before clearing this file and restarting."
+        )
+
+
 async def run() -> None:
     s = Settings()
+    check_execution_halt(s)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     log = logging.getLogger("microbot")
     run_id = uuid4().hex
@@ -158,6 +178,11 @@ async def run() -> None:
     feat_version = features_version(s)
     broker = LiveBroker(s) if s.mode == "live" else PaperBroker(s)
     storage = Storage(s.db_path, s.parquet_dir)
+    risk = EntryRisk(s, storage.query(
+        "SELECT ts, market, token_id, side, pnl FROM fills "
+        "WHERE mode = ? AND run_id IS NOT NULL AND ts >= ? ORDER BY ts",
+        [s.mode, day_start(time())],
+    ))
     ledger = Ledger(s.paper_starting_cash)
     books_writer = (
         PartitionedWriter(s.parquet_dir / "book_events", BOOK_EVENT_COLUMNS, "recv_ts",
@@ -170,6 +195,7 @@ async def run() -> None:
     # Books, tags and stream of the market being traded, for the dashboard's book file.
     current: dict = {"books": {}, "tags": {}, "stream": None}
     in_flight: dict[str, float] = {}
+    execution_errors: list[BaseException] = []
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -195,6 +221,7 @@ async def run() -> None:
     def record_fill(fill, tags: dict) -> None:
         storage.insert("fills", fill.as_dict() | tags | {"run_id": run_id})
         ledger.on_fill(fill)
+        risk.on_fill(fill.as_dict() | tags)
         snapshot()
         log.info("%s %s %.2f @ %.4f fee=%.5f pnl=%.4f (%s)", fill.mode, fill.side, fill.size,
                  fill.price, fill.fee, fill.pnl, fill.reason)
@@ -265,7 +292,7 @@ async def run() -> None:
             for book in books.values():
                 book.tick_size = market.tick_size
         await register_market(market)
-        strategy = MicrostructureStrategy(ms)
+        strategy = MicrostructureStrategy(ms, broker.fees.get)
 
         def on_status(kind: str, connection_id: int, detail: str) -> None:
             stream_event(kind, None, None, detail, connection_id)
@@ -288,8 +315,10 @@ async def run() -> None:
                 await consume_market(ms, market, books, strategy, stream, tags, health, tasks)
         except TimeoutError:
             pass
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            # Drain executions before shutdown closes their ledger/storage, including on SIGTERM.
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
         await close_positions(market, books, tags)
         for token in books:
             engine.state.pop(token, None)
@@ -332,11 +361,25 @@ async def run() -> None:
 
     async def execute(intent: Intent, book: OrderBook, context: OrderContext,
                       tags: dict) -> None:
-        in_flight[context.market] = intent.size * intent.limit_price
         try:
             record_execution(await broker.submit(intent, book, context), tags)
         finally:
             in_flight.pop(context.market, None)
+
+    def execution_done(task: asyncio.Task, tasks: set[asyncio.Task]) -> None:
+        tasks.discard(task)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            execution_errors.append(error)
+            log.error("Execution failed; pausing the bot: %s", error)
+            stop.set()
+            if s.mode == "live":
+                try:
+                    write_json_atomic(s.execution_halt_path, {
+                        "ts": time(), "run_id": run_id,
+                        "reason": "execution_failed_requires_reconciliation",
+                    })
+                except OSError:
+                    log.exception("Could not persist the execution halt; disable automatic restarts")
 
     async def consume_market(ms: Settings, market: Market, books: dict[str, OrderBook],
                              strategy: MicrostructureStrategy, stream: MarketStream,
@@ -436,23 +479,27 @@ async def run() -> None:
                 predict(market, strategy, rows, probabilities, signal_value, now, in_gap,
                         "skip", "order_in_flight")
                 continue
-            intents = strategy.decide(rows, broker.positions(), now)
+            block = "data_gap" if in_gap else risk.block_reason(market.slug or ms.yes_token_id, now)
+            intents = strategy.decide(rows, broker.positions(), now, entry_block_reason=block)
             prediction_id = predict(market, strategy, rows, probabilities, signal_value, now,
                                     in_gap)
             for intent in intents:
                 context = OrderContext(now, market.slug, market.outcome(intent.token_id),
                                        prediction_id)
+                # Reserve synchronously: buffered WS messages may yield without giving a task CPU.
+                in_flight[market.slug] = intent.size * intent.limit_price
                 task = asyncio.create_task(
                     execute(intent, books[intent.token_id], context, tags[intent.token_id]))
                 tasks.add(task)
-                task.add_done_callback(tasks.discard)
+                task.add_done_callback(lambda done: execution_done(done, tasks))
+            await asyncio.sleep(0)
 
     async def export_periodically() -> None:
         while True:
             await asyncio.sleep(s.export_interval_seconds)
-            storage.export_parquet()
+            await finish_in_thread(storage.export_parquet)
             if books_writer:
-                await asyncio.to_thread(books_writer.maybe_flush)
+                await finish_in_thread(books_writer.maybe_flush)
 
     async def snapshot_periodically() -> None:
         while True:
@@ -499,6 +546,8 @@ async def run() -> None:
         for task in done:
             if not task.cancelled() and task.exception():
                 raise task.exception()
+        if execution_errors:
+            raise execution_errors[0]
     finally:
         for task in tasks:
             task.cancel()

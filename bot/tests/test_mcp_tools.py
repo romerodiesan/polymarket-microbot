@@ -122,6 +122,17 @@ def test_run_scope_filters_legacy_rows_and_resolves_latest(server):
     assert by_slug["btc-1"]["fills"] == 2
 
 
+def test_aggregated_restarted_portfolios_have_no_single_capital_roi(server):
+    storage = Storage(server.DATA_DIR / "microbot.duckdb", server.DATA_DIR / "parquet")
+    storage.upsert("runs", {"run_id": "r2", "started_at": NOW - 10, "mode": "paper"})
+    storage.insert("fills", {"ts": NOW - 5, "token_id": "u2", "side": "BUY", "size": 1,
+                             "price": 0.4, "fee": 0.0, "mode": "paper", "run_id": "r2"})
+    storage.close()
+    result = server.get_paper_performance(lookback_hours=1)
+    assert result["scope"]["run_count"] == 2
+    assert result["totals"]["roi_on_max_committed"] is None
+
+
 def test_execution_quality(server):
     quality = server.get_execution_quality(lookback_hours=1)
     assert quality["totals"]["orders"] == 2

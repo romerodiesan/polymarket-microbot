@@ -22,6 +22,7 @@ from .features import FeatureRow, combine_market
 from .markets import fetch_gamma_market, market_from_gamma, parse_resolution
 from .model import FEATURE_COLUMNS
 from .positions import PositionBook
+from .risk import EntryRisk
 from .strategy import MIN_LIMIT_PRICE, Intent, MicrostructureStrategy
 
 DEFAULT_TICK = 0.01
@@ -242,18 +243,22 @@ def apply_l2(books: dict[str, OrderBook], rows: list[dict]) -> None:
 class Portfolio:
     cash: float
     positions: PositionBook = field(default_factory=PositionBook)
+    risk: EntryRisk | None = None
 
 
 def replay_market(meta: dict, rows: pd.DataFrame, l2: pd.DataFrame, settings: Settings,
                   scenario: Scenario, latency_ms: float, portfolio: Portfolio) -> MarketResult:
     yes, no = meta["yes_token_id"], meta["no_token_id"]
     ms = settings.model_copy(update={"yes_token_id": yes, "no_token_id": no})
-    strategy = MicrostructureStrategy(ms)
     tick = float(meta.get("tick_size") or DEFAULT_TICK)
     fee_rate = float(meta.get("fee_rate") if pd.notna(meta.get("fee_rate")) else settings.fee_rate)
     fee_rate *= scenario.fee_multiplier
     exponent = meta.get("fee_exponent")
     fee_exponent = float(exponent) if exponent is not None and pd.notna(exponent) else 1.0
+    strategy = MicrostructureStrategy(ms, lambda token: (fee_rate, "replay", fee_exponent))
+    if portfolio.risk is None:
+        portfolio.risk = EntryRisk(settings)
+    risk = portfolio.risk
     latency = latency_ms * scenario.latency_multiplier / 1000
     end_ts = meta.get("end_ts")
     deadline = (float(end_ts) - settings.rollover_seconds
@@ -287,6 +292,7 @@ def replay_market(meta: dict, rows: pd.DataFrame, l2: pd.DataFrame, settings: Se
         result.filled += 1
         result.partial += filled < intent.size - 1e-9
         pnl = held.apply(intent.token_id, intent.side, filled, price, fee, current["ts"])
+        risk.on_fill({"ts": current["ts"], "market": meta["slug"], "side": intent.side, "pnl": pnl})
         portfolio.cash += -(filled * price + fee) if intent.side == "BUY" else filled * price - fee
         result.pnl += pnl
         result.fees += fee
@@ -299,7 +305,8 @@ def replay_market(meta: dict, rows: pd.DataFrame, l2: pd.DataFrame, settings: Se
 
     def run_pending(until: float) -> None:
         while pending and pending[0][0] <= until:
-            _, intent, touch = pending.pop(0)
+            due, intent, touch = pending.pop(0)
+            current["ts"] = due
             execute(intent, touch)
 
     current = {"ts": 0.0}
@@ -334,7 +341,9 @@ def replay_market(meta: dict, rows: pd.DataFrame, l2: pd.DataFrame, settings: Se
                     k: (0.0 if pd.isna(v) else v) for k, v in r.items() if k in ROW_FIELDS})
         if payload and payload[0].get("combine"):
             combine_market(feature_rows, yes, no)
-        for intent in strategy.decide(feature_rows, held.positions, ts):
+        block = ("data_gap" if any(truthy(r.get("in_gap")) for r in payload)
+                 else risk.block_reason(meta["slug"], ts))
+        for intent in strategy.decide(feature_rows, held.positions, ts, entry_block_reason=block):
             touch = feature_rows[intent.token_id].best_ask if intent.side == "BUY" else None
             pending.append((ts + latency, intent, touch))
 
@@ -355,6 +364,8 @@ def replay_market(meta: dict, rows: pd.DataFrame, l2: pd.DataFrame, settings: Se
             if held.get(token).open:
                 size = held.size(token)
                 pnl = held.apply(token, "SELL", size, float(payout), 0.0, result.end_ts)
+                risk.on_fill({"ts": result.end_ts, "market": meta["slug"], "side": "SELL",
+                              "pnl": pnl})
                 portfolio.cash += size * float(payout)
                 result.pnl += pnl
                 result.exits.append(pnl)

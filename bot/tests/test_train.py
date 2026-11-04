@@ -1,6 +1,6 @@
 import pandas as pd
 
-from microbot.train import label_frame, temporal_split
+from microbot.train import _embargoed, label_frame, temporal_split
 
 
 def frame_from(mids: list[float], token: str = "yes", step: float = 1.0) -> pd.DataFrame:
@@ -37,3 +37,34 @@ def test_temporal_split_applies_embargo():
     train_df, test_df = temporal_split(frame, horizon_seconds=5)
     assert train_df["ts"].max() + 5 < test_df["ts"].min()
     assert len(test_df) == 20
+
+
+def test_embargo_uses_the_observation_actually_used_for_the_label():
+    # A sparse stream can assign the t+15 label from t+30, inside the next block.
+    train = pd.DataFrame({"ts": [1.0, 2.0], "future_ts": [16.0, 31.0]})
+    after = pd.DataFrame({"ts": [25.0]})
+    assert _embargoed(train, after, 15)["ts"].tolist() == [1.0]
+
+
+def test_temporal_split_purges_delayed_labels_too():
+    frame = pd.DataFrame({"ts": [float(i) for i in range(100)],
+                          "future_ts": [float(i + 30) for i in range(100)]})
+    train, test = temporal_split(frame, horizon_seconds=15)
+    assert train["future_ts"].max() < test["ts"].min()
+
+
+def test_labels_do_not_bridge_a_capture_gap_or_restart():
+    frame = frame_from([0.5, 0.5, 0.6, 0.6])
+    frame["run_id"] = ["a", "a", "b", "b"]
+    assert label_frame(frame, horizon_seconds=2, min_move=0).empty
+    frame["run_id"] = "a"
+    frame["in_gap"] = [False, True, False, False]
+    assert label_frame(frame, horizon_seconds=2, min_move=0).empty
+    frame = frame_from([0.5, 0.6], step=6)
+    assert label_frame(frame, horizon_seconds=3, min_move=0).empty
+
+
+def test_all_gap_rows_produce_an_empty_label_frame():
+    frame = frame_from([0.5, 0.6, 0.7])
+    frame["in_gap"] = True
+    assert label_frame(frame, horizon_seconds=1, min_move=0).empty

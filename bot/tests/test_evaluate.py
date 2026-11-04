@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -78,7 +79,8 @@ def paper_pnl(features: pd.DataFrame, meta: pd.DataFrame, s: Settings) -> dict[s
             feature_rows = {r["token_id"]: FeatureRow(**{
                 k: v for k, v in r.items() if k not in ("market", "outcome")}) for r in records}
             for intent in strategy.decide(feature_rows, broker.positions(), ts):
-                execution = asyncio.run(broker.submit(intent, books[intent.token_id]))
+                with patch("microbot.broker.time", return_value=float(ts)):
+                    execution = asyncio.run(broker.submit(intent, books[intent.token_id]))
                 total += execution.fill.pnl if execution.fill else 0.0
         for token, payout in ((ms.yes_token_id, market["payout_yes"]),
                               (ms.no_token_id, market["payout_no"])):
@@ -120,6 +122,20 @@ def test_pessimistic_scenarios_never_beat_base():
                 "weekly", "concentration", "bootstrap", "execution"):
         assert key in base
     assert base["max_capital_committed"] > 0
+
+
+def test_replay_respects_gap_and_market_entry_limits():
+    features, meta = fixture(markets=2)
+    features["in_gap"] = True
+    blocked = evaluate(features, meta, settings(), latency_ms=0,
+                       scenarios={"base": SCENARIOS["base"]}, baselines=(), bootstrap=10)
+    assert blocked["scenarios"]["base"]["entries"] == 0
+    features["in_gap"] = False
+    limited = evaluate(features, meta, settings(max_entries_per_market=1), latency_ms=0,
+                       scenarios={"base": SCENARIOS["base"]}, baselines=(), bootstrap=10)
+    base = limited["scenarios"]["base"]
+    assert base["entries"] == 2
+    assert all(m["entries"] <= 1 for m in base["per_market"])
 
 
 def test_replay_uses_recorded_l2_books(tmp_path):

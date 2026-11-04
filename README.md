@@ -119,7 +119,11 @@ PM_MODEL_PATH=data/model.joblib
 
 El entrenador usa regresión logística. Etiqueta cada observación con el movimiento del midpoint
 `--horizon-seconds` después, y solo cuenta movimientos mayores que medio spread más `--min-move`, es
-decir, que cubrirían el coste de cruzar. Solo usa filas con el conjunto de features actual.
+un filtro de ruido para clasificar dirección. Esta etiqueta es condicional a que haya movimiento;
+no representa el retorno neto ejecutable y no incluye las dos comisiones ni todo el spread.
+Solo usa filas con el conjunto de features actual. Las etiquetas no cruzan reinicios, filas
+`in_gap` ni silencios mayores de 5 s. El embargo usa el timestamp de la observación futura que
+realmente se utilizó, que puede ser posterior al horizonte nominal.
 
 - **Split por mercado:** cada mercado (YES y NO juntos) cae entero en un solo lado. El último 20 % de los
   mercados (`--holdout-markets`) es el bloque de prueba y no se toca durante el ajuste. Entre bloques se
@@ -263,6 +267,11 @@ de balances/fills desde el canal autenticado, comprobar tick size y minimum orde
 validar fees, añadir kill switch persistente y probar ejecuciones parciales. Empieza en `record`, después
 `paper`, y compara los fills simulados con el libro real.
 
+Si no se puede confirmar el estado de una orden live, el bot se detiene sin inventar un fill y
+escribe `PM_EXECUTION_HALT_PATH`. El archivo bloquea los siguientes arranques live, incluso bajo un
+supervisor. Solo se elimina después de reconciliar órdenes, fills y balances con el venue. El inventario
+live sigue requiriendo reconciliación completa al arrancar antes de exponer capital.
+
 ## Señal y estrategia
 
 Por token, el motor calcula en cada evento del libro el OFI de Cont–Kukanov–Stoikov y la presión de
@@ -283,8 +292,17 @@ El `score` guardado es `señal` para YES y `−señal` para NO. La estrategia:
   spread y la profundidad pasan los filtros.
 - Dimensiona entre la mitad y el total de `PM_ORDER_SIZE_SHARES` según la convicción, con tope en
   `PM_MAX_TOP_PARTICIPATION` del tamaño visible en el mejor ask.
+- Bloquea entradas durante `in_gap`, con un lado del mercado ausente o si ni siquiera el máximo
+  precio de venta permitido permitiría alcanzar el objetivo neto. Esto comprueba factibilidad,
+  no estima la probabilidad de alcanzar el objetivo ni demuestra esperanza de ganancia positiva.
 - Sale por `take_profit`, `stop_loss`, `max_hold`, `signal_reversal` (la señal cruza `−PM_EXIT_THRESHOLD`) o
   `signal_faded` (señal neutra tras `PM_MIN_HOLD_SECONDS`). El motivo queda en `fills.reason`.
+- `take_profit` exige ganancia neta por acción al límite de venta, usando la comisión del mercado y
+  el coste de entrada completo. `stop_loss` mide movimiento del mid desde el precio de ejecución de
+  entrada antes de comisiones. El presupuesto de pérdidas diarias incluye el PnL neto realizado.
+- Pausa nuevas compras por pérdida diaria, racha de salidas perdedoras, límite de entradas por
+  mercado o enfriamiento tras una pérdida. Las salidas siguen permitidas. Restaura los controles
+  diarios desde los fills del mismo modo al reiniciar y comparte las reglas con el replay.
 - Envía órdenes FAK con límite `mejor precio ± PM_MAX_SLIPPAGE`. En paper, el fill recorre el libro
   después de la latencia y puede ser parcial; `fills.pnl` registra el PnL realizado de cada venta.
 - Al resolverse el mercado, lo que siga abierto se liquida con un fill `reason="settlement"` al pago
@@ -311,7 +329,11 @@ snapshots repetidos solo guardan los niveles que cambian. En un mercado BTC de 1
 | `PM_SPREAD_PENALTY` | 0.02 | Señal extra exigida por tick de spread |
 | `PM_MIN_PRICE` / `PM_MAX_PRICE` | 0.05 / 0.95 | Rango de precios operable |
 | `PM_MAX_VOLATILITY` | 0.05 | Volatilidad máxima del mid por minuto |
-| `PM_TAKE_PROFIT` / `PM_STOP_LOSS` | 0.03 / 0.02 | Salidas sobre el mid frente al precio de entrada |
+| `PM_TAKE_PROFIT` / `PM_STOP_LOSS` | 0.03 / 0.02 | Objetivo neto por acción / movimiento adverso del mid desde la ejecución de entrada |
+| `PM_MAX_DAILY_LOSS` | 10 | Pausa al alcanzar esta pérdida neta realizada en el día UTC; 0 desactiva |
+| `PM_MAX_CONSECUTIVE_LOSSES` | 5 | Pausa tras esta racha de salidas perdedoras; 0 desactiva; se reinicia al cambiar el día UTC |
+| `PM_MAX_ENTRIES_PER_MARKET` | 3 | Máximo de compras ejecutadas por mercado; 0 desactiva |
+| `PM_LOSS_COOLDOWN_SECONDS` | 30 | Espera antes de volver a comprar en un mercado tras una pérdida |
 | `PM_MIN_HOLD_SECONDS` / `PM_MAX_HOLD_SECONDS` | 10 / 600 | Tiempo mínimo antes de salida neutra y máximo en posición |
 | `PM_MAX_SLIPPAGE` | 0.01 | Distancia máxima del límite FAK al mejor precio |
 | `PM_MAX_TOP_PARTICIPATION` | 0.5 | Fracción máxima del tamaño del mejor nivel |
@@ -328,6 +350,12 @@ snapshots repetidos solo guardan los niveles que cambian. En un mercado BTC de 1
 | `PM_BOOK_STATE_DEPTH` | 20 | Niveles por lado en ese archivo |
 
 Los pesos y umbrales son un punto de partida, no parámetros optimizados.
+Los límites de entrada son controles de investigación, no un límite garantizado de pérdida: las
+posiciones abiertas, los fills parciales y los huecos pueden añadir pérdidas. Una sesión paper sigue
+reiniciando el capital simulado; el MCP devuelve ROI nulo cuando se agregan varias sesiones, porque
+no comparten un denominador de capital. El PnL de una ventana que corta una posición requiere una
+reconciliación específica del inventario inicial. Consulta [validación económica](docs/validation.md)
+antes de promover una estrategia.
 
 ## Pruebas
 

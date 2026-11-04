@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     max_slippage: float = Field(0.01, ge=0)
     max_top_participation: float = Field(0.5, gt=0, le=1)
     min_order_shares: float = Field(1.0, gt=0)
+    # Entry pauses, restored from the day's recorded fills after a restart. 0 disables a limit.
+    max_daily_loss: float = Field(10.0, ge=0)
+    max_consecutive_losses: int = Field(5, ge=0)
+    max_entries_per_market: int = Field(3, ge=0)
+    loss_cooldown_seconds: float = Field(30.0, ge=0)
+    execution_halt_path: Path = Path("data/bot/execution_halt.json")
 
     private_key: str | None = None
     api_key: str | None = None

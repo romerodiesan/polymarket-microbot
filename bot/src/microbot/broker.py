@@ -9,13 +9,11 @@ from uuid import uuid4
 
 from .book import OrderBook, TopOfBook
 from .config import Settings
+from .fees import FEE_DECIMALS, polymarket_fee
 from .positions import Position, PositionBook
 from .strategy import Intent
 
 log = logging.getLogger(__name__)
-
-FEE_DECIMALS = 5
-
 
 @dataclass(slots=True)
 class Fill:
@@ -130,11 +128,6 @@ class Broker(Protocol):
     def settle(self, token_id: str, payout: float, ts: float, order_id: str) -> Fill | None: ...
 
 
-def polymarket_fee(fee_rate: float, size: float, price: float, exponent: float = 1.0) -> float:
-    """Taker fee in USDC: shares * rate * (p * (1 - p)) ** exponent, rounded like the exchange."""
-    return round(size * fee_rate * (price * (1 - price)) ** exponent, FEE_DECIMALS)
-
-
 def venue_fee(trades: list[dict], rate: float, exponent: float, source: str) -> tuple[float, str]:
     """Taker fee of the trades the venue matched, each at its own price.
 
@@ -222,6 +215,10 @@ class PaperBroker:
         now = time()
         order.ack_ts, order.latency_ms = now, latency
         order.snapshot("exec", order_book.top())
+        if not order_book.updated_at or now - order_book.updated_at > self.s.stale_book_seconds:
+            order.finish(0.0, None, 0.0, now)
+            order.reject_reason = "stale_book"
+            return Execution(order, None)
         rate, source, exponent = self.fees.get(intent.token_id)
         order.fee_rate, order.fee_source = rate, source
         filled, price, fee, reject = take(
@@ -343,11 +340,16 @@ class LiveBroker:
 
         try:
             data = await to_thread(self.client.get_order, venue_id) if venue_id else None
-        except Exception as exc:  # noqa: BLE001
-            log.warning("Could not reconcile order %s (%s); booking the limit", venue_id, exc)
-            data = None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Unknown execution state for order {venue_id}; reconcile venue balances and "
+                "fills before restarting"
+            ) from exc
         if not data:
-            return intent.size, intent.limit_price, []
+            raise RuntimeError(
+                f"Missing execution state for order {venue_id}; reconcile venue balances and "
+                "fills before restarting"
+            )
         filled = float(data.get("size_matched") or 0)
         price = float(data.get("price") or intent.limit_price)
         trade_ids = data.get("associate_trades") or []
