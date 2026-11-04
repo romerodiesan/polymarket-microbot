@@ -1,8 +1,10 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from time import time
 
 from .config import Settings
 from .features import FeatureRow
+from .fees import polymarket_fee
 from .positions import Position
 
 MAX_LIMIT_PRICE = 0.99
@@ -32,12 +34,14 @@ class Decision:
 class MicrostructureStrategy:
     """Directional taker strategy that holds at most one side of a binary market."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings,
+                 fee_for_token: Callable[[str], tuple[float, str, float]] | None = None) -> None:
         self.s = settings
         self.yes = settings.yes_token_id
         self.no = settings.no_token_id
         self.last_action_at = 0.0
         self.last_decision = Decision()
+        self.fee_for_token = fee_for_token or (lambda token: (settings.fee_rate, "config", 1.0))
 
     def market_signal(self, rows: dict[str, FeatureRow]) -> float:
         if self.yes in rows:
@@ -47,8 +51,8 @@ class MicrostructureStrategy:
         return 0.0
 
     def decide(self, rows: dict[str, FeatureRow], positions: dict[str, Position],
-               now: float | None = None) -> list[Intent]:
-        now = now or time()
+               now: float | None = None, *, entry_block_reason: str | None = None) -> list[Intent]:
+        now = time() if now is None else now
         signal = self.market_signal(rows)
 
         for token in (self.yes, self.no):
@@ -65,6 +69,12 @@ class MicrostructureStrategy:
                                               self.s.exit_threshold)
                 return []
 
+        if entry_block_reason:
+            self._skip(entry_block_reason)
+            return []
+        if self.yes not in rows or self.no not in rows:
+            self._skip("incomplete_market")
+            return []
         entry = self._entry(rows, signal, now)
         if entry:
             self.last_action_at = now
@@ -79,9 +89,13 @@ class MicrostructureStrategy:
             return None
         favour = signal if token == self.yes else -signal
         age = now - pos.opened_at
-        if row.midpoint >= pos.avg_price + self.s.take_profit:
+        limit = max(MIN_LIMIT_PRICE, row.best_bid - self.s.max_slippage)
+        rate, _, exponent = self.fee_for_token(token)
+        net_per_share = limit - polymarket_fee(rate, pos.size, limit, exponent) / pos.size
+        net_per_share -= pos.avg_price  # Already includes the allocated entry commission.
+        if net_per_share >= self.s.take_profit:
             reason = "take_profit"
-        elif row.midpoint <= pos.avg_price - self.s.stop_loss:
+        elif row.midpoint <= pos.entry_price - self.s.stop_loss:
             reason = "stop_loss"
         elif age >= self.s.max_hold_seconds:
             reason = "max_hold"
@@ -91,7 +105,6 @@ class MicrostructureStrategy:
             reason = "signal_faded"
         else:
             return None
-        limit = max(MIN_LIMIT_PRICE, row.best_bid - self.s.max_slippage)
         return Intent(token, "SELL", pos.size, limit, f"{reason} score={favour:.3f}")
 
     def _skip(self, reason: str, token: str = "", threshold: float | None = None) -> None:
@@ -134,5 +147,11 @@ class MicrostructureStrategy:
             self._skip("min_size", token, required)
             return None
         limit = min(MAX_LIMIT_PRICE, row.best_ask + self.s.max_slippage)
+        rate, _, exponent = self.fee_for_token(token)
+        entry_cost = limit + polymarket_fee(rate, size, limit, exponent) / size
+        best_exit = MAX_LIMIT_PRICE - polymarket_fee(rate, size, MAX_LIMIT_PRICE, exponent) / size
+        if best_exit - entry_cost < self.s.take_profit:
+            self._skip("net_target_unreachable", token, required)
+            return None
         self._skip("entry", token, required)
         return Intent(token, "BUY", size, limit, f"entry score={strength:.3f} req={required:.3f}")

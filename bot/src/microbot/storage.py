@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 
 import duckdb
 import pandas as pd
@@ -63,7 +64,7 @@ SCHEMAS: dict[str, list[tuple[str, str]]] = {
     "positions": [
         ("ts", D), ("run_id", V), ("market", V), ("token_id", V), ("outcome", V),
         ("size", D), ("avg_price", D), ("mark_mid", D), ("mark_bid", D), ("unrealized", D),
-        ("opened_at", D),
+        ("opened_at", D), ("entry_fees", D),
     ],
     "predictions": [
         ("prediction_id", V), ("ts", D), ("run_id", V), ("market", V), ("token_id", V),
@@ -96,6 +97,7 @@ class Storage:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         parquet_dir.mkdir(parents=True, exist_ok=True)
         self.parquet_dir = parquet_dir
+        self._export_lock = Lock()
         self.db = duckdb.connect(str(db_path))
         for table, columns in SCHEMAS.items():
             ddl = ", ".join(f"{name} {kind}" for name, kind in columns)
@@ -135,17 +137,23 @@ class Storage:
         return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
 
     def export_parquet(self) -> None:
-        for table in SCHEMAS:
-            final = self.parquet_dir / f"{table}.parquet"
-            tmp = self.parquet_dir / f".{table}.parquet.tmp"
-            target = tmp.as_posix().replace("'", "''")
-            # Small row groups let the dashboard decode just the newly appended tail.
-            self.db.execute(
-                f"COPY {table} TO '{target}' "
-                "(FORMAT PARQUET, ROW_GROUP_SIZE 16384, OVERWRITE_OR_IGNORE true)"
-            )
-            # Atomic swap so readers (the dashboard) never see a half-written file.
-            os.replace(tmp, final)
+        # Each exporting thread needs its own cursor. Never share the ingestion cursor.
+        with self._export_lock:
+            con = self.db.cursor()
+            try:
+                con.execute("BEGIN TRANSACTION")
+                for table in SCHEMAS:
+                    final = self.parquet_dir / f"{table}.parquet"
+                    tmp = self.parquet_dir / f".{table}.parquet.tmp"
+                    target = tmp.as_posix().replace("'", "''")
+                    con.execute(
+                        f"COPY {table} TO '{target}' "
+                        "(FORMAT PARQUET, ROW_GROUP_SIZE 16384, OVERWRITE_OR_IGNORE true)"
+                    )
+                    os.replace(tmp, final)
+                con.execute("COMMIT")
+            finally:
+                con.close()
 
     def close(self) -> None:
         self.export_parquet()
@@ -206,6 +214,7 @@ class PartitionedWriter:
         self.flush_seconds = flush_seconds
         self.retention_days = retention_days
         self.buffer: list[dict] = []
+        self._buffer_lock = Lock()
         self.last_flush = time.time()
         directory.mkdir(parents=True, exist_ok=True)
         self.sequence = 1 + max(
@@ -213,10 +222,12 @@ class PartitionedWriter:
         )
 
     def append(self, row: dict) -> None:
-        self.buffer.append(row)
+        with self._buffer_lock:
+            self.buffer.append(row)
 
     def extend(self, rows: Iterable[dict]) -> None:
-        self.buffer.extend(rows)
+        with self._buffer_lock:
+            self.buffer.extend(rows)
 
     def maybe_flush(self, now: float | None = None) -> None:
         now = now or time.time()
@@ -226,9 +237,11 @@ class PartitionedWriter:
     def flush(self, now: float | None = None) -> None:
         now = now or time.time()
         self.last_flush = now
-        if self.buffer:
-            frame = pd.DataFrame(self.buffer, columns=self.names)
-            self.buffer = []
+        # Detach before pandas can release the GIL; newly arriving rows stay in the new list.
+        with self._buffer_lock:
+            batch, self.buffer = self.buffer, []
+        if batch:
+            frame = pd.DataFrame(batch, columns=self.names)
             for name, kind in self.columns:
                 if kind in (D, I):
                     frame[name] = pd.to_numeric(frame[name], errors="coerce")

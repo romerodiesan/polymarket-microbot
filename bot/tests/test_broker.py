@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from microbot.book import OrderBook
-from microbot.broker import OrderContext, PaperBroker, polymarket_fee, venue_fee
+from microbot.broker import LiveBroker, OrderContext, PaperBroker, polymarket_fee, venue_fee
 from microbot.config import Settings
 from microbot.strategy import Intent
 
@@ -114,6 +114,30 @@ def test_latency_executes_against_the_book_after_the_delay():
     assert execution.fill.price == pytest.approx(0.52)
     assert execution.order.latency_ms == 20
     assert execution.order.signal_ts == 1.0
+
+
+def test_paper_rejects_a_book_that_goes_stale_in_flight(monkeypatch):
+    book = make_book()
+    book.updated_at = 100.0
+    monkeypatch.setattr("microbot.broker.time", lambda: 110.0)
+    b = broker(paper_latency_ms=1)
+    execution = submit(b, Intent("yes", "BUY", 2, 0.52, "entry"), book)
+    assert execution.fill is None and execution.order.reject_reason == "stale_book"
+    assert b.cash == 1000 and not b.positions()
+
+
+@pytest.mark.parametrize("lookup", [None, "error"])
+def test_missing_live_reconciliation_never_invents_a_fill(lookup):
+    class Client:
+        def get_order(self, venue_id):
+            if lookup == "error":
+                raise OSError("temporary outage")
+            return lookup
+
+    b = object.__new__(LiveBroker)
+    b.client = Client()
+    with pytest.raises(RuntimeError, match="reconcile venue balances"):
+        asyncio.run(b.reconcile("venue-order-1", Intent("yes", "BUY", 2, 0.52, "entry")))
 
 
 def test_settlement_pays_out_and_closes_the_position():

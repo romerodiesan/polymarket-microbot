@@ -2,7 +2,7 @@ import pytest
 
 from microbot.config import Settings
 from microbot.features import FeatureRow
-from microbot.positions import Position
+from microbot.positions import Position, PositionBook
 from microbot.strategy import MicrostructureStrategy
 
 
@@ -63,7 +63,7 @@ def test_never_opens_opposite_side_while_holding():
 @pytest.mark.parametrize(
     ("yes_mid", "signal", "age", "reason"),
     [
-        (0.55, 0.5, 5, "take_profit"),
+        (0.59, 0.5, 5, "take_profit"),
         (0.48, 0.5, 5, "stop_loss"),
         (0.50, 0.5, 700, "max_hold"),
         (0.50, 0.01, 20, "signal_faded"),
@@ -115,3 +115,58 @@ def test_last_decision_reports_hold_and_exit():
     strategy.decide(market(-0.6), held, now=1005)
     assert strategy.last_decision.action == "exit"
     assert strategy.last_decision.intended_size == 4
+
+
+def test_profit_target_requires_net_proceeds_at_the_order_limit():
+    strategy = MicrostructureStrategy(settings())
+    # This midpoint cleared the old target, but sale fee + spread + slippage consume the gain.
+    held = {"yes": Position(size=4, avg_price=0.51, opened_at=1000)}
+    assert strategy.decide(market(0.5, yes_mid=0.55), held, now=1005) == []
+    [intent] = strategy.decide(market(0.5, yes_mid=0.59), held, now=1006)
+    from microbot.fees import polymarket_fee
+
+    net = intent.limit_price - polymarket_fee(0.07, 4, intent.limit_price) / 4 - 0.51
+    assert net >= strategy.s.take_profit
+
+
+def test_uses_the_markets_actual_fee_schedule_for_profit_target():
+    held = {"yes": Position(size=4, avg_price=0.51, opened_at=1000)}
+    free = MicrostructureStrategy(settings(), lambda token: (0, "venue:free", 1))
+    charged = MicrostructureStrategy(settings(), lambda token: (0.14, "stress", 1))
+    assert free.decide(market(0.5, yes_mid=0.57), held, now=1005)
+    assert charged.decide(market(0.5, yes_mid=0.57), held, now=1005) == []
+
+
+def test_entry_commission_does_not_move_the_price_stop_closer():
+    book = PositionBook()
+    book.apply("yes", "BUY", 2, 0.51, 0.035, 1000)
+    strategy = MicrostructureStrategy(settings())
+    # The entry fee is part of net P&L, not an adverse price movement.
+    assert strategy.decide(market(0.5), book.positions, now=1001) == []
+    [intent] = strategy.decide(market(0.5, yes_mid=0.48), book.positions, now=1002)
+    assert intent.reason.startswith("stop_loss")
+
+
+def test_gap_blocks_entries_but_allows_exits():
+    strategy = MicrostructureStrategy(settings())
+    assert strategy.decide(market(0.9), {}, now=100, entry_block_reason="data_gap") == []
+    assert strategy.last_decision.reason == "data_gap"
+    held = {"yes": Position(size=4, avg_price=0.51, opened_at=95)}
+    [intent] = strategy.decide(market(-0.6), held, now=100, entry_block_reason="data_gap")
+    assert intent.side == "SELL"
+
+
+def test_needs_both_sides_and_rejects_an_unreachable_net_target():
+    strategy = MicrostructureStrategy(settings())
+    assert strategy.decide({"yes": market(0.9)["yes"]}, {}, now=100) == []
+    assert strategy.last_decision.reason == "incomplete_market"
+    expensive = MicrostructureStrategy(settings(max_price=0.99, max_slippage=0.03,
+                                               take_profit=0.1))
+    assert expensive.decide(market(0.9, yes_mid=0.94), {}, now=100) == []
+    assert expensive.last_decision.reason == "net_target_unreachable"
+
+
+def test_zero_is_a_valid_replay_timestamp():
+    strategy = MicrostructureStrategy(settings())
+    strategy.decide(market(0.9), {}, now=0.0)
+    assert strategy.last_action_at == 0.0

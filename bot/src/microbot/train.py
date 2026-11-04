@@ -28,20 +28,29 @@ def load_features(db_path: Path, features_path: Path | None) -> pd.DataFrame:
     ).fetchdf()
 
 
-def label_frame(frame: pd.DataFrame, horizon_seconds: float, min_move: float) -> pd.DataFrame:
-    """Attach the midpoint `horizon_seconds` later and keep moves that beat crossing costs.
+def label_frame(frame: pd.DataFrame, horizon_seconds: float, min_move: float,
+                max_gap_seconds: float = 5.0) -> pd.DataFrame:
+    """Attach a later midpoint within the same uninterrupted capture segment.
 
-    A move counts only if it exceeds half the spread plus `min_move`; target is 1 for up moves.
-    Rows without a future observation within twice the horizon are dropped.
+    This is a direction label conditional on a move exceeding half-spread + min_move.
+    It is not an executable net return label: fees and the second crossing are not included.
     """
-    frame = frame.sort_values("ts").copy()
+    frame = frame.sort_values(["token_id", "ts"]).copy()
+    gap = frame.get("in_gap", pd.Series(False, index=frame.index)).fillna(False).astype(bool)
+    boundary = (frame["token_id"].ne(frame["token_id"].shift())
+                | frame["ts"].diff().gt(max_gap_seconds) | gap | gap.shift(fill_value=False))
+    if "run_id" in frame:
+        runs = frame["run_id"].fillna("")
+        boundary |= runs.ne(runs.shift())
+    frame["label_segment"] = boundary.cumsum()
+    frame = frame.loc[~gap].sort_values("ts").copy()
     frame["target_ts"] = frame["ts"] + horizon_seconds
-    future = frame[["token_id", "ts", "midpoint"]].rename(
+    future = frame[["token_id", "label_segment", "ts", "midpoint"]].rename(
         columns={"ts": "future_ts", "midpoint": "future_mid"}
     )
     merged = pd.merge_asof(
         frame.sort_values("target_ts"), future.sort_values("future_ts"),
-        left_on="target_ts", right_on="future_ts", by="token_id",
+        left_on="target_ts", right_on="future_ts", by=["token_id", "label_segment"],
         direction="forward", tolerance=horizon_seconds,
     )
     merged = merged.dropna(subset=["future_mid"])
@@ -55,7 +64,8 @@ def label_frame(frame: pd.DataFrame, horizon_seconds: float, min_move: float) ->
 def temporal_split(frame: pd.DataFrame, horizon_seconds: float, test_fraction: float = 0.2):
     """Split by time, dropping training rows whose label window reaches into the test period."""
     split_ts = frame["ts"].quantile(1 - test_fraction)
-    train_df = frame[frame["ts"] + horizon_seconds < split_ts]
+    label_end = frame["future_ts"] if "future_ts" in frame else frame["ts"] + horizon_seconds
+    train_df = frame[label_end < split_ts]
     test_df = frame[frame["ts"] >= split_ts]
     return train_df, test_df
 
@@ -80,7 +90,8 @@ def _embargoed(train: pd.DataFrame, after: pd.DataFrame, horizon: float) -> pd.D
     """Drop training rows whose label window reaches the first row of `after`."""
     if after.empty:
         return train
-    return train[train["ts"] + horizon < after["ts"].min()]
+    label_end = train["future_ts"] if "future_ts" in train else train["ts"] + horizon
+    return train[label_end < after["ts"].min()]
 
 
 def market_split(frame: pd.DataFrame, horizon_seconds: float, holdout_fraction: float = 0.2,

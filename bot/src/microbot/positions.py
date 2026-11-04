@@ -8,6 +8,12 @@ class Position:
     size: float = 0.0
     avg_price: float = 0.0
     opened_at: float = 0.0
+    entry_fees: float = 0.0
+
+    @property
+    def entry_price(self) -> float:
+        """Average execution price before fees; avg_price remains the full cost basis."""
+        return self.avg_price - self.entry_fees / self.size if self.open else 0.0
 
     @property
     def open(self) -> bool:
@@ -43,13 +49,16 @@ class PositionBook:
                 pos.opened_at = ts
             cost = pos.avg_price * pos.size + price * size + fee
             pos.size += size
+            pos.entry_fees += fee
             pos.avg_price = cost / pos.size
             self.max_committed = max(self.max_committed, self.committed())
             return 0.0
         size = min(size, pos.size)
         pnl = (price - pos.avg_price) * size - fee
+        pos.entry_fees *= 1 - size / pos.size if pos.open else 0.0
         pos.size -= size
         if not pos.open:
             pos.size, pos.avg_price, pos.opened_at = 0.0, 0.0, 0.0
+            pos.entry_fees = 0.0
         self.realized_pnl += pnl
         return pnl
